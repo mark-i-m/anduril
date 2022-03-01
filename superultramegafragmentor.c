@@ -83,6 +83,7 @@ static struct allocation *allocations = NULL;
 // Configuration.
 
 // When flipped to 1, start fragmenting; then, reset to 0.
+// When flipped to 2, free any held memory; then, reset to 0.
 static int trigger = 0;
 static int trigger_set(const char *val, const struct kernel_param *kp);
 static const struct kernel_param_ops trigger_ops = {
@@ -423,13 +424,41 @@ static int do_fragment(void) {
     return 0;
 }
 
+static void free_memory(void) {
+    u64 alloc_count = 0, page_count = 0;
+    struct allocation *alloc;
+
+    // Free all allocations.
+    while (allocations) {
+        alloc = allocations;
+        allocations = alloc->next;
+
+        alloc_count += 1;
+        page_count += 1 << alloc->order;
+        //printk(KERN_WARNING "frag: free(pages=%p, size=%llu)\n",
+        //        alloc->pages, alloc->order);
+
+        __free_pages(alloc->pages, alloc->order);
+        vfree(alloc);
+    }
+
+    printk(KERN_WARNING "frag: freed %lld allocations, %lld pages.\n",
+            alloc_count, page_count);
+}
+
 static int trigger_set(const char *val, const struct kernel_param *kp) {
     // Parse value.
     int ret = param_set_int(val, kp);
     if (ret != 0) return ret;
 
     // Trigger fragmentation.
-    ret = do_fragment();
+    if (trigger == 1) {
+        ret = do_fragment();
+    } else if (trigger == 2) {
+        free_memory();
+    } else {
+        ret = -EINVAL;
+    }
 
     // Reset trigger.
     trigger = 0;
@@ -453,23 +482,7 @@ static int mod_init(void) {
 module_init(mod_init);
 
 static void mod_exit(void) {
-    u64 count = 0;
-    struct allocation *alloc;
-
-    // Free all allocations.
-    while (allocations) {
-        alloc = allocations;
-        allocations = alloc->next;
-
-        ++count;
-        //printk(KERN_WARNING "frag: free(pages=%p, size=%llu)\n",
-        //        alloc->pages, alloc->order);
-
-        __free_pages(alloc->pages, alloc->order);
-        vfree(alloc);
-    }
-
-    printk(KERN_WARNING "frag: freed %lld allocations.\n", count);
+    free_memory();
     printk(KERN_WARNING "frag: Exit.\n");
 }
 module_exit(mod_exit);
