@@ -39,7 +39,6 @@ struct profile_node {
 
     // The index of the first outgoing edge from this node in the list of edges.
     u64 first_edge_idx;
-    u64 nedges;
 };
 
 struct profile_edge {
@@ -174,7 +173,7 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
     char *line_end = NULL;
     struct profile_node *node;
     struct profile_edge *edge;
-    u64 discard, ecount = 0, prob_total;
+    u64 discard, ecount = 0, prob_total, node_nedges;
 
     // Free any existing profile.
     if (profile) {
@@ -248,12 +247,12 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
             if (ret == -1) ret = -EINVAL;
             goto err_out;
         }
-        node->nedges = ecount / 2;
-        nedges += node->nedges;
+        node_nedges = ecount / 2;
+        nedges += node_nedges;
 
         // printk(KERN_WARNING "frag: nedges so far %llu\n", nedges);
 
-        if (node->nedges == 0) {
+        if (node_nedges == 0) {
             printk(KERN_ERR "frag: must have at least one outgoing edge\n");
             goto err_out;
         }
@@ -309,8 +308,8 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
             prob_total += edge->prob;
         }
 
-        if (prob_total > 100) {
-            printk(KERN_ERR "frag: probabilities add to %llu > 100\n", prob_total);
+        if (prob_total != 100) {
+            printk(KERN_ERR "frag: probabilities add to %llu != 100\n", prob_total);
             goto err_out;
         }
     }
@@ -398,7 +397,7 @@ static int do_fragment(void) {
             return -ENOMEM;
         }
         alloc->order = current_node->order;
-        alloc->pages = alloc_pages(alloc->flags, alloc->order);
+        alloc->pages = alloc_pages(current_node->flags, alloc->order);
         if (!alloc->pages) {
             return -ENOMEM;
         }
@@ -454,6 +453,7 @@ static int mod_init(void) {
 module_init(mod_init);
 
 static void mod_exit(void) {
+    u64 count = 0;
     struct allocation *alloc;
 
     // Free all allocations.
@@ -461,13 +461,15 @@ static void mod_exit(void) {
         alloc = allocations;
         allocations = alloc->next;
 
-        printk(KERN_WARNING "frag: free(pages%p, size=%llu)\n",
-                alloc->pages, alloc->order);
+        ++count;
+        //printk(KERN_WARNING "frag: free(pages=%p, size=%llu)\n",
+        //        alloc->pages, alloc->order);
 
         __free_pages(alloc->pages, alloc->order);
         vfree(alloc);
     }
 
+    printk(KERN_WARNING "frag: freed %lld allocations.\n", count);
     printk(KERN_WARNING "frag: Exit.\n");
 }
 module_exit(mod_exit);
