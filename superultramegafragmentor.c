@@ -34,7 +34,7 @@ struct allocation {
 // node B, and so on). There is no guarantee that they are sorted, though.
 
 struct profile_node {
-    u64 npages;
+    u64 order;
     u64 flags;
 
     // The index of the first outgoing edge from this node in the list of edges.
@@ -213,7 +213,7 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
         node = &profile->nodes[i++];
 
         // Parse size
-        ret = profile_parse_u64(&cursor, line_end, 10, &node->npages);
+        ret = profile_parse_u64(&cursor, line_end, 10, &node->order);
         if (ret == -1) {
             printk(KERN_ERR "frag: expected size, found end of line\n");
             ret = -EINVAL;
@@ -348,7 +348,7 @@ static int profile_get(char *buffer, const struct kernel_param *kp) {
 
         len += sprintf(buffer + len,
                 "%llu: size=%llu flags=%llx edges=",
-                i, node->npages, node->flags);
+                i, node->order, node->flags);
 
         buffer[len] = 0;
 
@@ -389,16 +389,15 @@ static int do_fragment(void) {
     current_node = &profile->nodes[0];
 
     while(pages_sofar < npages) {
-        printk(KERN_WARNING "frag: random node %lu\n",
-                profile_node_idx(profile, current_node));
+        //printk(KERN_WARNING "frag: random node %lu\n",
+        //        profile_node_idx(profile, current_node));
 
         // Do the allocation at current node.
         alloc = vzalloc(sizeof(struct allocation));
         if (!alloc) {
             return -ENOMEM;
         }
-        // TODO: npages is not the same as order...
-        alloc->order = current_node->npages;
+        alloc->order = current_node->order;
         // TODO: flags
         alloc->pages = alloc_pages(GFP_KERNEL, alloc->order);
         if (!alloc->pages) {
@@ -407,7 +406,6 @@ static int do_fragment(void) {
         alloc->next = allocations;
         allocations = alloc;
 
-        // TODO: figure out order vs npages...
         pages_sofar += 1 << alloc->order;
 
         // Then, randomly walk to a neighbor.
@@ -418,10 +416,10 @@ static int do_fragment(void) {
             walk += e->prob;
             if (rand < walk) break;
         }
-        printk(KERN_WARNING "frag: rand=%u walk=%u\n", rand, walk);
+        //printk(KERN_WARNING "frag: rand=%u walk=%u\n", rand, walk);
         current_node = n;
     }
-    
+
     printk(KERN_WARNING "frag: The deed is done.\n");
 
     return 0;
