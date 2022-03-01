@@ -398,8 +398,7 @@ static int do_fragment(void) {
             return -ENOMEM;
         }
         alloc->order = current_node->order;
-        // TODO: flags
-        alloc->pages = alloc_pages(GFP_KERNEL, alloc->order);
+        alloc->pages = alloc_pages(alloc->flags, alloc->order);
         if (!alloc->pages) {
             return -ENOMEM;
         }
@@ -444,6 +443,12 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
 static int mod_init(void) {
     printk(KERN_WARNING "frag: Init.\n");
+
+    // Print a bunch of useful values for convenience.
+    printk(KERN_WARNING "frag: GFP_KERNEL=%x\n", GFP_KERNEL);
+    printk(KERN_WARNING "frag: GFP_USER=%x\n", GFP_USER);
+    printk(KERN_WARNING "frag: __GFP_MOVABLE=%x\n", __GFP_MOVABLE);
+
     return 0;
 }
 module_init(mod_init);
