@@ -64,6 +64,9 @@ struct profile {
 // The whole set of `allocation`s as a singly-linked list.
 static struct allocation *allocations = NULL;
 static u64 nallocations = 0;
+static u64 nallocations_pages = 0;
+// Locks `allocations`, `nallocations`, and `nallocations_pages`.
+static DEFINE_SPINLOCK(allocation_lock);
 
 // Given a node, find the index of that node.
 #define profile_node_idx(profile, node) ((node) - ((profile)->nodes))
@@ -406,7 +409,8 @@ static int do_fragment(void) {
         }
         alloc->next = allocations;
         allocations = alloc;
-        ++nallocations;
+        nallocations += 1;
+        nallocations_pages += 1 << alloc->order;
 
         pages_sofar += 1 << alloc->order;
 
@@ -422,13 +426,13 @@ static int do_fragment(void) {
         current_node = n;
     }
 
-    printk(KERN_WARNING "frag: The deed is done.\n");
+    printk(KERN_WARNING "frag: The deed is done. allocs=%llu pages=%llu\n",
+            nallocations, nallocations_pages);
 
     return 0;
 }
 
 static void free_memory(void) {
-    u64 alloc_count = 0, page_count = 0;
     struct allocation *alloc;
 
     // Free all allocations.
@@ -436,8 +440,6 @@ static void free_memory(void) {
         alloc = allocations;
         allocations = alloc->next;
 
-        alloc_count += 1;
-        page_count += 1 << alloc->order;
         //printk(KERN_WARNING "frag: free(pages=%p, size=%llu)\n",
         //        alloc->pages, alloc->order);
 
@@ -445,16 +447,20 @@ static void free_memory(void) {
         vfree(alloc);
     }
 
-    nallocations = 0;
-
     printk(KERN_WARNING "frag: freed %lld allocations, %lld pages.\n",
-            alloc_count, page_count);
+            nallocations, nallocations_pages);
+
+    // Reset counts.
+    nallocations = 0;
+    nallocations_pages = 0;
 }
 
 static int trigger_set(const char *val, const struct kernel_param *kp) {
     // Parse value.
     int ret = param_set_int(val, kp);
     if (ret != 0) return ret;
+
+    spin_lock(&allocation_lock);
 
     // Trigger fragmentation.
     if (trigger == 1) {
@@ -464,6 +470,8 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
     } else {
         ret = -EINVAL;
     }
+
+    spin_unlock(&allocation_lock);
 
     // Reset trigger.
     trigger = 0;
@@ -476,19 +484,74 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
 static unsigned long
 frag_shrink_count(struct shrinker *shrink, struct shrink_control *sc) {
-    return nallocations;
+    // TODO: should probably only return number of movable allocations + some
+    // small number of unmovable (to simulate freed memory)
+    return nallocations_pages;
+}
+
+// Unlink and free the `curr` allocation.
+static void free_allocation(
+        struct allocation *prev,
+        struct allocation *curr)
+{
+    // Sanity checks: if no prev pointer, then this must be the head of the
+    // list. Otherwise, these two elements must be linked...
+    BUG_ON(prev && prev->next != curr);
+    BUG_ON(!prev && allocations != curr);
+
+    // Unlink.
+    if (prev) {
+        prev->next = curr->next;
+    } else {
+        allocations = curr->next;
+    }
+
+    // Free curr and update counts.
+    nallocations -= 1;
+    nallocations_pages -= 1 << curr->order;
+    __free_pages(curr->pages, curr->order);
+    vfree(curr);
 }
 
 static unsigned long
-mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
+frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
-    struct allocation *prev = NULL, *next = NULL, *current = allocations;
+    int nr_to_scan = sc->nr_to_scan;
+    struct allocation *prev = NULL, *curr, *next;
+    u32 i = 0;
+    u64 n;
+    u64 order;
 
-    // TODO: scan the list, free random allocations, update nallocs
-    // TODO: shrink only the amount requested by the shrinker
-    while (...) {
-        
+    printk(KERN_WARNING "frag: shrinking...\n");
+
+    spin_lock(&allocation_lock);
+
+    n = nallocations_pages;
+    curr = allocations;
+
+    // Free a random subset of `nr_to_scan` allocations.
+    // NOTE: all of the counts here are in units of pages, not allocations.
+    while (curr && nr_to_scan > 0) {
+        next = curr->next;
+        order = curr->order;
+
+        // Credit: Bentley. Programming Pearls, based on Knuth.
+        if (prandom_u32() % (n - i) < nr_to_scan) {
+            freed += 1 << order;
+            nr_to_scan -= 1 << order;
+
+            printk(KERN_WARNING "frag: shrink pages=%p order=%llu\n",
+                    curr->pages, order);
+            free_allocation(prev, curr);
+        } else {
+            prev = curr;
+        }
+
+        curr = next;
+        i += 1 << order;
     }
+
+    spin_unlock(&allocation_lock);
 
     return freed;
 }
@@ -521,7 +584,9 @@ module_init(mod_init);
 static void mod_exit(void) {
     unregister_shrinker(&frag_shrinker);
 
+    spin_lock(&allocation_lock);
     free_memory();
+    spin_unlock(&allocation_lock);
     printk(KERN_WARNING "frag: Exit.\n");
 }
 module_exit(mod_exit);
