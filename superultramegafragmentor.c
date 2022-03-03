@@ -6,6 +6,7 @@
 #include <linux/gfp.h>
 #include <linux/vmalloc.h>
 #include <linux/prandom.h>
+#include <linux/shrinker.h>
 
 MODULE_AUTHOR("Mark Mansi");
 MODULE_LICENSE("Dual MIT/GPL");
@@ -62,6 +63,7 @@ struct profile {
 
 // The whole set of `allocation`s as a singly-linked list.
 static struct allocation *allocations = NULL;
+static u64 nallocations = 0;
 
 // Given a node, find the index of that node.
 #define profile_node_idx(profile, node) ((node) - ((profile)->nodes))
@@ -404,6 +406,7 @@ static int do_fragment(void) {
         }
         alloc->next = allocations;
         allocations = alloc;
+        ++nallocations;
 
         pages_sofar += 1 << alloc->order;
 
@@ -442,6 +445,8 @@ static void free_memory(void) {
         vfree(alloc);
     }
 
+    nallocations = 0;
+
     printk(KERN_WARNING "frag: freed %lld allocations, %lld pages.\n",
             alloc_count, page_count);
 }
@@ -467,10 +472,42 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Shrinker for memory reclamation.
+
+static unsigned long
+frag_shrink_count(struct shrinker *shrink, struct shrink_control *sc) {
+    return nallocations;
+}
+
+static unsigned long
+mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
+    unsigned long freed = 0;
+    struct allocation *prev = NULL, *next = NULL, *current = allocations;
+
+    // TODO: scan the list, free random allocations, update nallocs
+    // TODO: shrink only the amount requested by the shrinker
+    while (...) {
+        
+    }
+
+    return freed;
+}
+
+static struct shrinker frag_shrinker = {
+    .count_objects = frag_shrink_count,
+    .scan_objects = frag_shrink_scan,
+};
+
+////////////////////////////////////////////////////////////////////////////////
 // Module init/exit.
 
 static int mod_init(void) {
+    int ret;
+
     printk(KERN_WARNING "frag: Init.\n");
+
+    ret = register_shrinker(&frag_shrinker);
+    if (ret) return ret;
 
     // Print a bunch of useful values for convenience.
     printk(KERN_WARNING "frag: GFP_KERNEL=%x\n", GFP_KERNEL);
@@ -482,6 +519,8 @@ static int mod_init(void) {
 module_init(mod_init);
 
 static void mod_exit(void) {
+    unregister_shrinker(&frag_shrinker);
+
     free_memory();
     printk(KERN_WARNING "frag: Exit.\n");
 }
