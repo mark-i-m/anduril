@@ -61,7 +61,10 @@ struct profile {
 };
 
 
-// The whole set of `allocation`s as a singly-linked list.
+// The whole set of `allocation`s as a singly-linked list. When the list is
+// constructed we insert nodes into random positions, so that temporally
+// adjacent allocations are not adjacent in the list. This allows us to remove
+// a random subset of allocations easily by just taking the front of the list.
 static struct allocation *allocations = NULL;
 static u64 nallocations = 0;
 static u64 nallocations_pages = 0;
@@ -376,14 +379,62 @@ static int profile_get(char *buffer, const struct kernel_param *kp) {
 ////////////////////////////////////////////////////////////////////////////////
 // The Meat.
 
+// Create the given allocation but do not link it into the list.
+static int alloc_memory(u64 flags, u64 order, struct allocation **alloc) {
+    *alloc = vzalloc(sizeof(struct allocation));
+    if (!alloc) {
+        return -ENOMEM;
+    }
+    (*alloc)->order = order;
+    (*alloc)->pages = alloc_pages(flags, order);
+    if (!(*alloc)->pages) {
+        return -ENOMEM;
+    }
+
+    (*alloc)->next = NULL;
+
+    return 0;
+}
+
+// Insert the given `struct allocation` into the `allocations` list at a random
+// position from `prev`, possibly wrapping around to the `head`.
+static void alloc_rand_insert(struct allocation **head,
+                              u64 nallocations,
+                              struct allocation *prev,
+                              struct allocation *alloc)
+{
+    u32 rand_offset, i;
+
+    if (*head == NULL) {
+        *head = alloc;
+        return;
+    }
+    if (prev == NULL) prev = *head;
+
+    // Insert at a random offset from `prev`.
+    //rand_offset = prandom_u32() % (nallocations + 1);
+    rand_offset = prandom_u32() % 5;
+
+    for (i = 0; i < rand_offset; ++i) {
+        prev = prev->next;
+        if (prev == NULL) prev = *head;
+    }
+
+    BUG_ON(prev == NULL);
+
+    // Insert here...
+    alloc->next = prev->next;
+    prev->next = alloc;
+}
+
 // Do a random walk over the markov process until we have allocated the needed
 // amount of memory.
 static int do_fragment(void) {
-    u64 pages_sofar = 0;
     struct profile_node *current_node, *n;
     struct profile_edge *e;
-    struct allocation *alloc;
+    struct allocation *alloc = NULL, *prev = NULL;
     u32 rand, walk;
+    int ret;
 
     if (!profile) {
         printk(KERN_ERR "frag: no profile\n");
@@ -393,26 +444,19 @@ static int do_fragment(void) {
     // Start at node 0 and then walk randomly.
     current_node = &profile->nodes[0];
 
-    while(pages_sofar < npages) {
+    while(nallocations_pages < npages) {
         //printk(KERN_WARNING "frag: random node %lu\n",
         //        profile_node_idx(profile, current_node));
 
         // Do the allocation at current node.
-        alloc = vzalloc(sizeof(struct allocation));
-        if (!alloc) {
-            return -ENOMEM;
-        }
-        alloc->order = current_node->order;
-        alloc->pages = alloc_pages(current_node->flags, alloc->order);
-        if (!alloc->pages) {
-            return -ENOMEM;
-        }
-        alloc->next = allocations;
-        allocations = alloc;
+        prev = alloc;
+        ret = alloc_memory(current_node->flags, current_node->order, &alloc);
+        if (ret != 0) return ret;
+
+        // Insert into list and update stats.
+        alloc_rand_insert(&allocations, nallocations, prev, alloc);
         nallocations += 1;
         nallocations_pages += 1 << alloc->order;
-
-        pages_sofar += 1 << alloc->order;
 
         // Then, randomly walk to a neighbor.
         rand = prandom_u32() % 100;
@@ -513,42 +557,23 @@ static void free_allocation(
     vfree(curr);
 }
 
+// Free a random subset of `nr_to_scan` pages. NOTE: all of the counts here are
+// in units of pages, not allocations. Because the list is already in a
+// randomized order, we can just delete the first `nr_to_scan` pages from the
+// head of the list.
 static unsigned long
 frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
-    int nr_to_scan = sc->nr_to_scan;
-    struct allocation *prev = NULL, *curr, *next;
-    u32 i = 0;
-    u64 n;
-    u64 order;
 
     printk(KERN_WARNING "frag: shrinking...\n");
 
     spin_lock(&allocation_lock);
 
-    n = nallocations_pages;
-    curr = allocations;
-
-    // Free a random subset of `nr_to_scan` allocations.
-    // NOTE: all of the counts here are in units of pages, not allocations.
-    while (curr && nr_to_scan > 0) {
-        next = curr->next;
-        order = curr->order;
-
-        // Credit: Bentley. Programming Pearls, based on Knuth.
-        if (prandom_u32() % (n - i) < nr_to_scan) {
-            freed += 1 << order;
-            nr_to_scan -= 1 << order;
-
-            printk(KERN_WARNING "frag: shrink pages=%p order=%llu\n",
-                    curr->pages, order);
-            free_allocation(prev, curr);
-        } else {
-            prev = curr;
-        }
-
-        curr = next;
-        i += 1 << order;
+    while (allocations && freed < sc->nr_to_scan) {
+        printk(KERN_WARNING "frag: shrink pages=%p order=%llu\n",
+                allocations->pages, allocations->order);
+        freed += 1 << allocations->order;
+        free_allocation(NULL, allocations);
     }
 
     spin_unlock(&allocation_lock);
