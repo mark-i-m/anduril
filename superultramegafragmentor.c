@@ -14,6 +14,10 @@ MODULE_LICENSE("Dual MIT/GPL");
 ////////////////////////////////////////////////////////////////////////////////
 // State.
 
+#define FLAGS_KERNEL (1 << 0)
+#define FLAGS_USER (1 << 1)
+#define FLAGS_BUDDY (1 << 2)
+
 // Represents a single allocation.
 struct allocation {
     // The first allocated page.
@@ -21,6 +25,9 @@ struct allocation {
 
     // Order of the allocation.
     u64 order;
+
+    // Flags of the allocation.
+    u64 flags;
 
     // Pointer to the next one.
     struct allocation *next;
@@ -381,17 +388,47 @@ static int profile_get(char *buffer, const struct kernel_param *kp) {
 
 // Create the given allocation but do not link it into the list.
 static int alloc_memory(u64 flags, u64 order, struct allocation **alloc) {
+    gfp_t gfp;
+    int i;
+
+    switch (flags) {
+        case FLAGS_KERNEL:
+            gfp = GFP_KERNEL;
+            break;
+        case FLAGS_USER:
+            gfp = GFP_USER;
+            break;
+        case FLAGS_BUDDY:
+            gfp = GFP_KERNEL;
+            break;
+        default:
+            BUG();
+    }
+
+    // Allocate memory and do bookkeepping.
     *alloc = vzalloc(sizeof(struct allocation));
     if (!alloc) {
         return -ENOMEM;
     }
     (*alloc)->order = order;
-    (*alloc)->pages = alloc_pages(flags, order);
+    (*alloc)->pages = alloc_pages(gfp, order);
     if (!(*alloc)->pages) {
         return -ENOMEM;
     }
-
+    (*alloc)->flags = flags;
     (*alloc)->next = NULL;
+
+    // Set private for the pages.
+    for (i = 0; i < (1 << order); ++i) {
+        switch (flags) {
+            case FLAGS_KERNEL:
+                SetPagePrivate(&(*alloc)->pages[i]);
+                break;
+            case FLAGS_USER:
+                SetPageReserved(&(*alloc)->pages[i]);
+                break;
+        }
+    }
 
     return 0;
 }
@@ -451,7 +488,11 @@ static int do_fragment(void) {
         // Do the allocation at current node.
         prev = alloc;
         ret = alloc_memory(current_node->flags, current_node->order, &alloc);
-        if (ret != 0) return ret;
+        if (ret != 0) {
+            printk(KERN_WARNING "frag: failed alloc_pages(%llu, %llu)\n",
+                    current_node->flags, current_node->order);
+            return ret;
+        }
 
         // Insert into list and update stats.
         alloc_rand_insert(&allocations, nallocations, prev, alloc);
@@ -470,10 +511,31 @@ static int do_fragment(void) {
         current_node = n;
     }
 
+    // TODO: free pages that have FLAGS_BUDDY
+
     printk(KERN_WARNING "frag: The deed is done. allocs=%llu pages=%llu\n",
             nallocations, nallocations_pages);
 
     return 0;
+}
+
+// Free a single allocation.
+static inline void free_single(struct allocation *alloc) {
+    int i;
+
+    for (i = 0; i < (1 << alloc->order); ++i) {
+        switch (alloc->flags) {
+            case FLAGS_KERNEL:
+                ClearPagePrivate(&alloc->pages[i]);
+                break;
+            case FLAGS_USER:
+                ClearPageReserved(&alloc->pages[i]);
+                break;
+        }
+    }
+
+    __free_pages(alloc->pages, alloc->order);
+    vfree(alloc);
 }
 
 static void free_memory(void) {
@@ -487,8 +549,7 @@ static void free_memory(void) {
         //printk(KERN_WARNING "frag: free(pages=%p, size=%llu)\n",
         //        alloc->pages, alloc->order);
 
-        __free_pages(alloc->pages, alloc->order);
-        vfree(alloc);
+        free_single(alloc);
     }
 
     printk(KERN_WARNING "frag: freed %lld allocations, %lld pages.\n",
@@ -553,8 +614,8 @@ static void free_allocation(
     // Free curr and update counts.
     nallocations -= 1;
     nallocations_pages -= 1 << curr->order;
-    __free_pages(curr->pages, curr->order);
-    vfree(curr);
+
+    free_single(curr);
 }
 
 // Free a random subset of `nr_to_scan` pages. NOTE: all of the counts here are
