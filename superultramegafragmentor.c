@@ -7,6 +7,7 @@
 #include <linux/vmalloc.h>
 #include <linux/prandom.h>
 #include <linux/shrinker.h>
+#include <linux/mm.h>
 
 MODULE_AUTHOR("Mark Mansi");
 MODULE_LICENSE("Dual MIT/GPL");
@@ -14,24 +15,14 @@ MODULE_LICENSE("Dual MIT/GPL");
 ////////////////////////////////////////////////////////////////////////////////
 // State.
 
-#define FLAGS_KERNEL (1 << 0)
-#define FLAGS_USER (1 << 1)
-#define FLAGS_BUDDY (1 << 2)
+#define FLAGS_BUDDY (1 << 0)
+#define FLAGS_FILE (1 << 1)
+#define FLAGS_ANON (1 << 2)
+#define FLAGS_ANON_THP (1 << 3)
+#define FLAGS_NONE (1 << 4)
+#define FLAGS_PINNED (1 << 5)
 
-// Represents a single allocation.
-struct allocation {
-    // The first allocated page.
-    struct page *pages;
-
-    // Order of the allocation.
-    u64 order;
-
-    // Flags of the allocation.
-    u64 flags;
-
-    // Pointer to the next one.
-    struct allocation *next;
-};
+#define GFP_FLAGS (__GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)
 
 // The profile graph.
 //
@@ -67,16 +58,12 @@ struct profile {
     u64 nedges;
 };
 
-
-// The whole set of `allocation`s as a singly-linked list. When the list is
-// constructed we insert nodes into random positions, so that temporally
-// adjacent allocations are not adjacent in the list. This allows us to remove
-// a random subset of allocations easily by just taking the front of the list.
-static struct allocation *allocations = NULL;
-static u64 nallocations = 0;
-static u64 nallocations_pages = 0;
-// Locks `allocations`, `nallocations`, and `nallocations_pages`.
-static DEFINE_SPINLOCK(allocation_lock);
+static u64 total_pages = 0;
+static struct list_head pages_pinned = LIST_HEAD_INIT(pages_pinned);
+static struct list_head pages_anon = LIST_HEAD_INIT(pages_anon);
+static struct list_head pages_anon_thp = LIST_HEAD_INIT(pages_anon_thp);
+static struct list_head pages_file = LIST_HEAD_INIT(pages_file);
+static DEFINE_SPINLOCK(allocation_lock); // locks the lists above...
 
 // Given a node, find the index of that node.
 #define profile_node_idx(profile, node) ((node) - ((profile)->nodes))
@@ -110,6 +97,10 @@ module_param_cb(trigger, &trigger_ops, &trigger, S_IWUSR | S_IRUSR | S_IRGRP | S
 // How much memory to allocate in units of 4KB pages.
 static u64 npages = 0;
 module_param(npages, ullong, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+
+// Whether to enable the shrinker or not.
+static bool enable_shrinker = 0;
+module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
 // Profile to fragment memory with.
 static struct profile *profile = NULL;
@@ -204,6 +195,13 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
     // Count the number of nodes.
     for (i = 0; val[i] != 0; ++i) {
         if (val[i] == ';') ++nnodes;
+    }
+
+    // Error: found no ';'...
+    if (nnodes == 0) {
+        printk(KERN_ERR "frag: no ';' found...\n");
+        ret = -EINVAL;
+        goto err_out;
     }
 
     //printk(KERN_WARNING "frag: %llu\n", nnodes);
@@ -386,118 +384,131 @@ static int profile_get(char *buffer, const struct kernel_param *kp) {
 ////////////////////////////////////////////////////////////////////////////////
 // The Meat.
 
-// Create the given allocation but do not link it into the list.
-static int alloc_memory(u64 flags, u64 order, struct allocation **alloc) {
-    gfp_t gfp;
+// Allocate N pages with as much contiguity as possible, and add them to the
+// given list of pages.
+static int alloc_npages(u64 n, struct list_head *list) {
+    u64 alloced = 0;
+    struct page *pages;
+    u64 current_order;
     int i;
 
-    switch (flags) {
-        case FLAGS_KERNEL:
-            gfp = GFP_KERNEL;
-            break;
-        case FLAGS_USER:
-            gfp = GFP_USER;
-            break;
-        case FLAGS_BUDDY:
-            gfp = GFP_KERNEL;
-            break;
-        default:
-            BUG();
-    }
+    while (alloced < n) {
+        current_order = min(MAX_ORDER - 1, ilog2(n - alloced));
+        pages = alloc_pages(GFP_FLAGS, current_order);
+        split_page(pages, current_order);
 
-    // Allocate memory and do bookkeepping.
-    *alloc = vzalloc(sizeof(struct allocation));
-    if (!alloc) {
-        return -ENOMEM;
-    }
-    (*alloc)->order = order;
-    (*alloc)->pages = alloc_pages(gfp, order);
-    if (!(*alloc)->pages) {
-        return -ENOMEM;
-    }
-    (*alloc)->flags = flags;
-    (*alloc)->next = NULL;
+        if (!pages) {
+            return -ENOMEM;
+        } else {
+            for (i = 0; i < (1 << current_order); ++i) {
+                list_add_tail(&pages[i].lru, list);
+            }
 
-    // Set private for the pages.
-    for (i = 0; i < (1 << order); ++i) {
-        switch (flags) {
-            case FLAGS_KERNEL:
-                SetPagePrivate(&(*alloc)->pages[i]);
-                break;
-            case FLAGS_USER:
-                SetPageReserved(&(*alloc)->pages[i]);
-                break;
+            alloced += 1 << current_order;
         }
     }
+
+    total_pages += alloced;
 
     return 0;
 }
 
-// Insert the given `struct allocation` into the `allocations` list at a random
-// position from `prev`, possibly wrapping around to the `head`.
-static void alloc_rand_insert(struct allocation **head,
-                              u64 nallocations,
-                              struct allocation *prev,
-                              struct allocation *alloc)
-{
-    u32 rand_offset, i;
+// Free all pages on the given list.
+static void free_all_pages(struct list_head *list) {
+    while (!list_empty(list)) {
+        // Remove from list.
+        struct page *p = list_first_entry(list, struct page, lru);
+        list_del_init(&p->lru);
 
-    if (*head == NULL) {
-        *head = alloc;
-        return;
+        // Clear any flags we may have set before we release the page to the
+        // buddy allocator.
+        ClearPagePrivate(p);
+        ClearPageReserved(p);
+
+        // Free the page back to the buddy allocator.
+        __free_pages(p, 0);
     }
-    if (prev == NULL) prev = *head;
-
-    // Insert at a random offset from `prev`.
-    //rand_offset = prandom_u32() % (nallocations + 1);
-    rand_offset = prandom_u32() % 5;
-
-    for (i = 0; i < rand_offset; ++i) {
-        prev = prev->next;
-        if (prev == NULL) prev = *head;
-    }
-
-    BUG_ON(prev == NULL);
-
-    // Insert here...
-    alloc->next = prev->next;
-    prev->next = alloc;
 }
 
-// Do a random walk over the markov process until we have allocated the needed
-// amount of memory.
-static int do_fragment(void) {
-    struct profile_node *current_node, *n;
-    struct profile_edge *e;
-    struct allocation *alloc = NULL, *prev = NULL;
-    u32 rand, walk;
-    int ret;
+// Get the `n`th element of the list, or the last element if there are fewer
+// than `n` elements left. If the list is empty, return null.
+static inline struct list_head *list_nth(struct list_head *head, u64 n) {
+    struct list_head *elem = head->next;
 
-    if (!profile) {
-        printk(KERN_ERR "frag: no profile\n");
-        return -EINVAL;
+    if (list_empty(head)) return NULL;
+
+    while (--n > 0 && !list_is_last(elem, head)) {
+        elem = elem->next;
     }
 
+    return elem;
+}
+
+// Allocate the memory. Then, do a random walk over the markov process until we
+// have fragmented all memory we allocated.
+static int do_fragment(void) {
+    int ret;
+    struct profile_node *current_node, *n;
+    struct profile_edge *e;
+    u32 rand, walk;
+    struct list_head allocated_pages = LIST_HEAD_INIT(allocated_pages);
+
+    // Sanity check...
+    if (!profile) {
+        printk(KERN_ERR "frag: no profile\n");
+        ret = -EINVAL;
+        goto free_and_error;
+    }
+
+    // Allocate the requested amount of memory. If the system was relatively
+    // unfragmented before (e.g., after a fresh reboot), then we can expect the
+    // pages in the list to be fairly contiguous and in order.
+    ret = alloc_npages(npages, &allocated_pages);
+    if (ret != 0) {
+        printk(KERN_ERR "frag: error allocating: %d\n", ret);
+        return ret;
+    }
+    printk(KERN_WARNING "frag: done allocating %llu pages\n", npages);
+
+    // Fragment the memory by doing a random walk over the profile.
     // Start at node 0 and then walk randomly.
     current_node = &profile->nodes[0];
+    while (!list_empty(&allocated_pages)) {
+        // Based on current_node, we want to remove `order` pages from
+        // `allocated_pages` and set them to the purpose indicated by `flags`.
+        struct list_head assigned_pages = LIST_HEAD_INIT(assigned_pages);
+        struct list_head *nth_entry = list_nth(&allocated_pages, 1 << current_node->order);
+        list_cut_position(&assigned_pages, &allocated_pages, nth_entry);
 
-    while(nallocations_pages < npages) {
-        //printk(KERN_WARNING "frag: random node %lu\n",
-        //        profile_node_idx(profile, current_node));
+        switch (current_node->flags) {
+            case FLAGS_NONE:
+            case FLAGS_PINNED:
+                list_splice_tail(&assigned_pages, pages_pinned.prev);
+                break;
 
-        // Do the allocation at current node.
-        prev = alloc;
-        ret = alloc_memory(current_node->flags, current_node->order, &alloc);
-        if (ret != 0) {
-            printk(KERN_WARNING "frag: failed alloc_pages(%llu, %llu)\n",
-                    current_node->flags, current_node->order);
-            return ret;
+            case FLAGS_FILE:
+                list_splice_tail(&assigned_pages, pages_file.prev);
+                break;
+
+            case FLAGS_ANON:
+                list_splice_tail(&assigned_pages, pages_anon.prev);
+                break;
+
+            case FLAGS_ANON_THP:
+                // TODO: make these actually be huge page aligned
+                list_splice_tail(&assigned_pages, pages_anon_thp.prev);
+                break;
+
+            case FLAGS_BUDDY:
+                free_all_pages(&assigned_pages);
+                break;
+
+            default:
+                free_all_pages(&assigned_pages);
+                ret = -EINVAL;
+                printk(KERN_ERR "frag: unrecognized flags: %llx\n", current_node->flags);
+                goto free_and_error;
         }
-
-        // Insert into list and update stats.
-        alloc_rand_insert(&allocations, nallocations, prev, alloc);
-        nallocations += 1;
-        nallocations_pages += 1 << alloc->order;
 
         // Then, randomly walk to a neighbor.
         rand = prandom_u32() % 100;
@@ -511,53 +522,24 @@ static int do_fragment(void) {
         current_node = n;
     }
 
-    // TODO: free pages that have FLAGS_BUDDY
-
-    printk(KERN_WARNING "frag: The deed is done. allocs=%llu pages=%llu\n",
-            nallocations, nallocations_pages);
+    printk(KERN_WARNING "frag: The deed is done. pages=%llu\n", npages);
 
     return 0;
-}
 
-// Free a single allocation.
-static inline void free_single(struct allocation *alloc) {
-    int i;
-
-    for (i = 0; i < (1 << alloc->order); ++i) {
-        switch (alloc->flags) {
-            case FLAGS_KERNEL:
-                ClearPagePrivate(&alloc->pages[i]);
-                break;
-            case FLAGS_USER:
-                ClearPageReserved(&alloc->pages[i]);
-                break;
-        }
-    }
-
-    __free_pages(alloc->pages, alloc->order);
-    vfree(alloc);
+free_and_error:
+    free_all_pages(&allocated_pages);
+    return ret;
 }
 
 static void free_memory(void) {
-    struct allocation *alloc;
+    free_all_pages(&pages_anon);
+    free_all_pages(&pages_anon_thp);
+    free_all_pages(&pages_file);
+    free_all_pages(&pages_pinned);
 
-    // Free all allocations.
-    while (allocations) {
-        alloc = allocations;
-        allocations = alloc->next;
+    printk(KERN_WARNING "frag: Freed %llu pages.\n", total_pages);
 
-        //printk(KERN_WARNING "frag: free(pages=%p, size=%llu)\n",
-        //        alloc->pages, alloc->order);
-
-        free_single(alloc);
-    }
-
-    printk(KERN_WARNING "frag: freed %lld allocations, %lld pages.\n",
-            nallocations, nallocations_pages);
-
-    // Reset counts.
-    nallocations = 0;
-    nallocations_pages = 0;
+    total_pages = 0;
 }
 
 static int trigger_set(const char *val, const struct kernel_param *kp) {
@@ -589,53 +571,27 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
 static unsigned long
 frag_shrink_count(struct shrinker *shrink, struct shrink_control *sc) {
-    // TODO: should probably only return number of movable allocations + some
-    // small number of unmovable (to simulate freed memory)
-    return nallocations_pages;
+    return enable_shrinker ? total_pages : 0;
 }
 
-// Unlink and free the `curr` allocation.
-static void free_allocation(
-        struct allocation *prev,
-        struct allocation *curr)
-{
-    // Sanity checks: if no prev pointer, then this must be the head of the
-    // list. Otherwise, these two elements must be linked...
-    BUG_ON(prev && prev->next != curr);
-    BUG_ON(!prev && allocations != curr);
-
-    // Unlink.
-    if (prev) {
-        prev->next = curr->next;
-    } else {
-        allocations = curr->next;
-    }
-
-    // Free curr and update counts.
-    nallocations -= 1;
-    nallocations_pages -= 1 << curr->order;
-
-    free_single(curr);
-}
-
-// Free a random subset of `nr_to_scan` pages. NOTE: all of the counts here are
-// in units of pages, not allocations. Because the list is already in a
-// randomized order, we can just delete the first `nr_to_scan` pages from the
-// head of the list.
+// Free a random subset of `nr_to_scan` pages. 
 static unsigned long
 frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
 
+    // TODO: Randomize the lists?
     printk(KERN_WARNING "frag: shrinking...\n");
 
     spin_lock(&allocation_lock);
 
-    while (allocations && freed < sc->nr_to_scan) {
-        printk(KERN_WARNING "frag: shrink pages=%p order=%llu\n",
-                allocations->pages, allocations->order);
-        freed += 1 << allocations->order;
-        free_allocation(NULL, allocations);
-    }
+    // TODO: Choose which list to free from. Prioritize LRU and anon non-THP pages.
+    // TODO: free a random subset
+//    while (allocations && freed < sc->nr_to_scan) {
+//        printk(KERN_WARNING "frag: shrink pages=%p order=%llu\n",
+//                allocations->pages, allocations->order);
+//        freed += 1 << allocations->order;
+//        free_allocation(NULL, allocations);
+//    }
 
     spin_unlock(&allocation_lock);
 

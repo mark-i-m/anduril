@@ -1,6 +1,6 @@
 
-#KPATH := /usr/src/linux-headers-`uname -r`
-KPATH := /users/markm/kernel-*/kbuild/
+KPATH := /usr/src/linux-headers-`uname -r`
+#KPATH := /users/markm/kernel-*/kbuild/
 
 obj-m := superultramegafragmentor.o
 
