@@ -58,7 +58,11 @@ struct profile {
     u64 nedges;
 };
 
-static u64 total_pages = 0;
+static u64 npages_total = 0;
+static u64 npages_pinned = 0;
+static u64 npages_anon = 0;
+static u64 npages_anon_thp = 0;
+static u64 npages_file = 0;
 static struct list_head pages_pinned = LIST_HEAD_INIT(pages_pinned);
 static struct list_head pages_anon = LIST_HEAD_INIT(pages_anon);
 static struct list_head pages_anon_thp = LIST_HEAD_INIT(pages_anon_thp);
@@ -406,42 +410,150 @@ static int alloc_npages(u64 n, struct list_head *list) {
 
             alloced += 1 << current_order;
         }
+
+        // Let the scheduler know we haven't deadlocked.
+        if (alloced % (1 << 12) == 0) {
+            cond_resched();
+        }
     }
 
-    total_pages += alloced;
+    npages_total += alloced;
 
     return 0;
+}
+
+// Free the first page of the list or do nothing if the list is empty.
+static inline void free_first_page(struct list_head *list) {
+    if (!list_empty(list)) {
+        // remove from list.
+        struct page *p = list_first_entry(list, struct page, lru);
+        list_del_init(&p->lru);
+
+        // clear any flags we may have set before we release the page to the
+        // buddy allocator.
+        ClearPagePrivate(p);
+        ClearPageReserved(p);
+
+        // free the page back to the buddy allocator.
+        __free_pages(p, 0);
+    }
 }
 
 // Free all pages on the given list.
 static void free_all_pages(struct list_head *list) {
     while (!list_empty(list)) {
-        // Remove from list.
-        struct page *p = list_first_entry(list, struct page, lru);
-        list_del_init(&p->lru);
-
-        // Clear any flags we may have set before we release the page to the
-        // buddy allocator.
-        ClearPagePrivate(p);
-        ClearPageReserved(p);
-
-        // Free the page back to the buddy allocator.
-        __free_pages(p, 0);
+        free_first_page(list);
     }
 }
 
+#define CACHE_GRANULARITY 1000
+
+struct linked_list_cache {
+    // The first element in the cache array.
+    struct list_head **cache;
+    // The number of elements in the cache.
+    u64 length;
+};
+
 // Get the `n`th element of the list, or the last element if there are fewer
 // than `n` elements left. If the list is empty, return null.
-static inline struct list_head *list_nth(struct list_head *head, u64 n) {
+static struct list_head *list_nth(struct list_head *head, u64 n) {
     struct list_head *elem = head->next;
 
     if (list_empty(head)) return NULL;
 
-    while (--n > 0 && !list_is_last(elem, head)) {
+    while (n-- > 0 && !list_is_last(elem, head)) {
         elem = elem->next;
     }
 
     return elem;
+}
+
+static inline void list_mk_cache(
+        struct linked_list_cache *cache,
+        struct list_head *head, u64 n)
+{
+    struct list_head *elem;
+    u64 i = 0;
+
+    printk(KERN_WARNING "frag: building cache...\n");
+
+    cache->length = n / CACHE_GRANULARITY;
+    cache->cache = vmalloc(cache->length * sizeof(struct page*));
+    BUG_ON(cache->cache == NULL); // Hopefully won't happen often.
+
+    list_for_each(elem, head) {
+        if (i % CACHE_GRANULARITY == 0) {
+            cache->cache[i / CACHE_GRANULARITY] = elem;
+        }
+
+        i += 1;
+    }
+}
+
+static struct list_head *list_nth_with_cache(
+        struct linked_list_cache *cache,
+        struct list_head *head, u64 n)
+{
+    u64 cachen = n / CACHE_GRANULARITY;
+    u64 remainder = n % CACHE_GRANULARITY;
+
+    return list_nth(cache->cache[cachen]->prev, remainder);
+}
+
+// Randomize the given list.
+static void list_randomize(struct list_head *head, u64 npages) {
+    struct list_head *curr = head->next, *prev = head, *second;
+    u32 i = 0, rand;
+    struct linked_list_cache cache = { };
+    u64 cachen;
+
+    if (list_empty(head)) {
+        return;
+    }
+
+    // Initialize cache...
+    list_mk_cache(&cache, head, npages);
+
+    while (!list_is_last(curr, head)) {
+        // Pick another random element from the rest of the list.
+        rand = prandom_u32() % (npages - i - 1);
+        second = list_nth_with_cache(&cache, head, i + 1 + rand);
+
+        // Swap them to randomize the list.
+        list_swap(curr, second);
+
+        // Update the cache...
+        if (i % CACHE_GRANULARITY == 0) {
+            cachen = ((u64)i) / CACHE_GRANULARITY;
+            cache.cache[cachen] = second;
+        }
+        if ((rand + i + 1) % CACHE_GRANULARITY == 0) {
+            cachen = ((u64)(rand + i + 1)) / CACHE_GRANULARITY;
+            cache.cache[cachen] = curr;
+        }
+
+        if (i % 1000 == 0) {
+            printk(KERN_ERR "frag: rand %p %d\n", head, i);
+            cond_resched();
+        }
+
+        // Move to the next element.
+        prev = prev->next;
+        curr = prev->next;
+        i += 1;
+    }
+}
+
+u64 list_count(struct list_head *head) {
+    u64 count = 0;
+    struct list_head *elem;
+
+    list_for_each(elem, head) {
+        count += 1;
+    }
+
+    return count;
 }
 
 // Allocate the memory. Then, do a random walk over the markov process until we
@@ -451,11 +563,17 @@ static int do_fragment(void) {
     struct profile_node *current_node, *n;
     struct profile_edge *e;
     u32 rand, walk;
+    u64 pages_remaining = npages;
     struct list_head allocated_pages = LIST_HEAD_INIT(allocated_pages);
 
     // Sanity check...
     if (!profile) {
         printk(KERN_ERR "frag: no profile\n");
+        ret = -EINVAL;
+        goto free_and_error;
+    }
+    if (npages == 0) {
+        printk(KERN_ERR "frag: must set npages\n");
         ret = -EINVAL;
         goto free_and_error;
     }
@@ -477,26 +595,31 @@ static int do_fragment(void) {
         // Based on current_node, we want to remove `order` pages from
         // `allocated_pages` and set them to the purpose indicated by `flags`.
         struct list_head assigned_pages = LIST_HEAD_INIT(assigned_pages);
-        struct list_head *nth_entry = list_nth(&allocated_pages, 1 << current_node->order);
+        u64 pages = min(pages_remaining, 1ull << current_node->order);
+        struct list_head *nth_entry = list_nth(&allocated_pages, pages - 1);
         list_cut_position(&assigned_pages, &allocated_pages, nth_entry);
 
         switch (current_node->flags) {
             case FLAGS_NONE:
             case FLAGS_PINNED:
                 list_splice_tail(&assigned_pages, pages_pinned.prev);
+                npages_pinned += pages;
                 break;
 
             case FLAGS_FILE:
                 list_splice_tail(&assigned_pages, pages_file.prev);
+                npages_file += pages;
                 break;
 
             case FLAGS_ANON:
                 list_splice_tail(&assigned_pages, pages_anon.prev);
+                npages_anon += pages;
                 break;
 
             case FLAGS_ANON_THP:
                 // TODO: make these actually be huge page aligned
                 list_splice_tail(&assigned_pages, pages_anon_thp.prev);
+                npages_anon_thp += pages;
                 break;
 
             case FLAGS_BUDDY:
@@ -510,6 +633,8 @@ static int do_fragment(void) {
                 goto free_and_error;
         }
 
+        pages_remaining -= pages;
+
         // Then, randomly walk to a neighbor.
         rand = prandom_u32() % 100;
         walk = 0;
@@ -521,6 +646,15 @@ static int do_fragment(void) {
         //printk(KERN_WARNING "frag: rand=%u walk=%u\n", rand, walk);
         current_node = n;
     }
+
+    // Randomize the lists. (We don't randomize pinned pages, though because
+    // they are not reclaimable).
+    printk(KERN_WARNING "frag: Randomize file pages. pages=%llu\n", npages_file);
+    list_randomize(&pages_file, npages_file);
+    printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", npages_anon);
+    list_randomize(&pages_anon, npages_anon);
+    printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", npages_anon_thp);
+    list_randomize(&pages_anon_thp, npages_anon_thp);
 
     printk(KERN_WARNING "frag: The deed is done. pages=%llu\n", npages);
 
@@ -537,9 +671,13 @@ static void free_memory(void) {
     free_all_pages(&pages_file);
     free_all_pages(&pages_pinned);
 
-    printk(KERN_WARNING "frag: Freed %llu pages.\n", total_pages);
+    printk(KERN_WARNING "frag: Freed %llu pages.\n", npages_total);
 
-    total_pages = 0;
+    npages_total = 0;
+    npages_anon = 0;
+    npages_anon_thp = 0;
+    npages_file = 0;
+    npages_pinned = 0;
 }
 
 static int trigger_set(const char *val, const struct kernel_param *kp) {
@@ -571,27 +709,65 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
 static unsigned long
 frag_shrink_count(struct shrinker *shrink, struct shrink_control *sc) {
-    return enable_shrinker ? total_pages : 0;
+    return enable_shrinker ? npages_total : 0;
 }
 
-// Free a random subset of `nr_to_scan` pages. 
+// Free a random subset of `nr_to_scan` pages.
 static unsigned long
 frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
 
-    // TODO: Randomize the lists?
     printk(KERN_WARNING "frag: shrinking...\n");
+
+    // Avoid deadlocks where we are trying to allocate and shrink at the same
+    // time. We should only enable the shrinker after we are done allocating
+    // and fragmenting memory.
+    if (!enable_shrinker) return 0;
 
     spin_lock(&allocation_lock);
 
-    // TODO: Choose which list to free from. Prioritize LRU and anon non-THP pages.
-    // TODO: free a random subset
-//    while (allocations && freed < sc->nr_to_scan) {
-//        printk(KERN_WARNING "frag: shrink pages=%p order=%llu\n",
-//                allocations->pages, allocations->order);
-//        freed += 1 << allocations->order;
-//        free_allocation(NULL, allocations);
-//    }
+    // The free lists are already randomized, so we can free a random subset by
+    // freeing pages from the head of the list.
+
+    // Figure out what we will reclaim. Initially we want to reclaim file
+    // memory and single anon pages. Then we will break apart THP pages.
+    while ((npages_file > 0 || npages_anon > 0 || npages_anon_thp > 0)
+            && freed < sc->nr_to_scan)
+    {
+        switch (prandom_u32() % 2) {
+            case 0: // file
+                if (npages_file > 0) {
+                    free_first_page(&pages_file);
+                    npages_file -= 1;
+                    freed += 1;
+                    break;
+                }
+                // fall through
+                // if we don't have file pages.
+
+            case 1: // anon
+                if (npages_anon > 0) {
+                    free_first_page(&pages_anon);
+                    npages_anon -= 1;
+                    freed += 1;
+                    break;
+                }
+                // fall through
+                // if we don't have single anon pages.
+
+            case 2: // anon thp -- will never happen on it's own. Only happens
+                    // by fall-through.
+                if (npages_anon_thp > 0) {
+                    free_first_page(&pages_anon_thp);
+                    npages_anon_thp -= 1;
+                    freed += 1;
+                }
+                break;
+
+            default:
+                BUG();
+        }
+    }
 
     spin_unlock(&allocation_lock);
 
@@ -613,11 +789,6 @@ static int mod_init(void) {
 
     ret = register_shrinker(&frag_shrinker);
     if (ret) return ret;
-
-    // Print a bunch of useful values for convenience.
-    printk(KERN_WARNING "frag: GFP_KERNEL=%x\n", GFP_KERNEL);
-    printk(KERN_WARNING "frag: GFP_USER=%x\n", GFP_USER);
-    printk(KERN_WARNING "frag: __GFP_MOVABLE=%x\n", __GFP_MOVABLE);
 
     return 0;
 }
