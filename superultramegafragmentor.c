@@ -422,6 +422,17 @@ static int alloc_npages(u64 n, struct list_head *list) {
     return 0;
 }
 
+static void set_page_flags(struct list_head *list,
+        bool private, bool private2, bool reserved)
+{
+    struct page *page;
+    list_for_each_entry(page, list, lru) {
+        if (private) SetPagePrivate(page);
+        if (private2) SetPagePrivate2(page);
+        if (reserved) SetPageReserved(page);
+    }
+}
+
 // Free the first page of the list or do nothing if the list is empty.
 static inline void free_first_page(struct list_head *list) {
     if (!list_empty(list)) {
@@ -432,6 +443,7 @@ static inline void free_first_page(struct list_head *list) {
         // clear any flags we may have set before we release the page to the
         // buddy allocator.
         ClearPagePrivate(p);
+        ClearPagePrivate2(p);
         ClearPageReserved(p);
 
         // free the page back to the buddy allocator.
@@ -649,12 +661,21 @@ static int do_fragment(void) {
 
     // Randomize the lists. (We don't randomize pinned pages, though because
     // they are not reclaimable).
+    //
+    // We also set some flags on each page to indicate which category the page
+    // is in when we use the kpfsnapshot tool. The set of flags for each
+    // category is arbitrary -- they just need to be different.
     printk(KERN_WARNING "frag: Randomize file pages. pages=%llu\n", npages_file);
     list_randomize(&pages_file, npages_file);
+    set_page_flags(&pages_file, false, true, false);
     printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", npages_anon);
     list_randomize(&pages_anon, npages_anon);
+    set_page_flags(&pages_file, true, false, false);
     printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", npages_anon_thp);
     list_randomize(&pages_anon_thp, npages_anon_thp);
+    set_page_flags(&pages_file, true, false, true);
+    printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", npages_pinned);
+    set_page_flags(&pages_file, false, false, true);
 
     printk(KERN_WARNING "frag: The deed is done. pages=%llu\n", npages);
 
