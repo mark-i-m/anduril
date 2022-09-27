@@ -808,7 +808,7 @@ static int mod_init(void) {
 
     printk(KERN_WARNING "frag: Init.\n");
 
-    ret = register_shrinker(&frag_shrinker);
+    ret = register_shrinker(&frag_shrinker, "superultramegafragmentor");
     if (ret) return ret;
 
     return 0;
