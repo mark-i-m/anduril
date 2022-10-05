@@ -107,6 +107,9 @@ static bool enable_shrinker = 0;
 module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
 // Profile to fragment memory with.
+#define PROFILE_STR_MAX 8192
+static char profile_str[PROFILE_STR_MAX];
+static size_t profile_str_n = 0;
 static struct profile *profile = NULL;
 static int profile_set(const char *val, const struct kernel_param *kp);
 static int profile_get(char *buffer, const struct kernel_param *kp);
@@ -151,6 +154,9 @@ static int profile_parse_u64(
     return 0;
 }
 
+// Attempts to parse the contents of `profile_str` and generate output to
+// `profile`. Returns an errno in case of error.
+//
 // Format for input:
 // - All one line with nodes ended by `;`, including the last one.
 // - No trailing or separating whitespace except as below.
@@ -175,12 +181,12 @@ static int profile_parse_u64(
 //            +------+
 //               1
 //
-static int profile_set(const char *val, const struct kernel_param *kp) {
+static int profile_parse(void) {
     u64 nnodes = 0;
     u64 nedges = 0;
     int i, j;
     int ret = 0;
-    const char *cursor = val;
+    const char *cursor = profile_str;
     char *line_end = NULL;
     struct profile_node *node;
     struct profile_edge *edge;
@@ -194,11 +200,11 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
         profile = NULL;
     }
 
-    printk(KERN_WARNING "frag: \"%s\"\n", val);
+    printk(KERN_WARNING "frag: \"%s\"\n", profile_str);
 
     // Count the number of nodes.
-    for (i = 0; val[i] != 0; ++i) {
-        if (val[i] == ';') ++nnodes;
+    for (i = 0; profile_str[i] != 0; ++i) {
+        if (profile_str[i] == ';') ++nnodes;
     }
 
     // Error: found no ';'...
@@ -284,7 +290,7 @@ static int profile_set(const char *val, const struct kernel_param *kp) {
         goto err_out;
     }
 
-    cursor = val;
+    cursor = profile_str;
     i = 0; // node idx.
     j = 0; // edge idx.
     while ((line_end = strchr(cursor, ';'))) {
@@ -344,6 +350,31 @@ err_out:
     profile = NULL;
 
     return ret;
+}
+
+// If `val` is empty, clear `profile_str`. Otherwise, append to the end of
+// `profile_str`. When the profile is `trigger`ed, it will be parsed and used.
+static int profile_set(const char *val, const struct kernel_param *kp) {
+    size_t val_len = strnlen(val, PROFILE_STR_MAX-1); // excludes null byte
+
+    // Clear existing profile if `val` is empty.
+    if (val_len == 0) {
+        profile_str_n = 0;
+        memset(profile_str, 0, PROFILE_STR_MAX);
+    }
+
+    // Check if there is enough space.
+    // profile_str_n is the position of the first NULL byte.
+    if (profile_str_n + val_len + 1 >= PROFILE_STR_MAX) {
+        return -ENOMEM;
+    }
+
+    strncpy(&profile_str[profile_str_n], val,
+            PROFILE_STR_MAX - profile_str_n - 1);
+    profile_str_n += val_len; // exclude NULL byte.
+    profile_str[profile_str_n] = '\0';
+
+    return 0;
 }
 
 static int profile_get(char *buffer, const struct kernel_param *kp) {
@@ -714,6 +745,11 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
     int ret = param_set_int(val, kp);
     if (ret != 0) return ret;
 
+    // Parse profile.
+    if ((ret = profile_parse()) != 0) {
+        return ret;
+    }
+
     spin_lock(&allocation_lock);
 
     // Trigger fragmentation.
@@ -815,6 +851,8 @@ static int mod_init(void) {
     int ret;
 
     printk(KERN_WARNING "frag: Init.\n");
+
+    memset(profile_str, 0, PROFILE_STR_MAX);
 
     ret = register_shrinker(&frag_shrinker, "superultramegafragmentor");
     if (ret) return ret;
