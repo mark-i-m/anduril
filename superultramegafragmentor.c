@@ -675,15 +675,15 @@ static int do_fragment(void) {
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", npages_anon);
     list_randomize(&pages_anon, npages_anon);
-    set_page_flags(&pages_file, /*lru*/false, /*priv*/true,
+    set_page_flags(&pages_anon, /*lru*/false, /*priv*/true,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", npages_anon_thp);
     list_randomize(&pages_anon_thp, npages_anon_thp);
-    set_page_flags(&pages_file, /*lru*/false, /*priv*/true,
-                                /*priv2*/true, /*opriv*/true, /*rsvd*/true);
+    set_page_flags(&pages_anon_thp, /*lru*/false, /*priv*/true,
+                                    /*priv2*/true, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", npages_pinned);
-    set_page_flags(&pages_file, /*lru*/false, /*priv*/false,
-                                /*priv2*/false, /*opriv*/true, /*rsvd*/true);
+    set_page_flags(&pages_pinned, /*lru*/false, /*priv*/false,
+                                  /*priv2*/false, /*opriv*/true, /*rsvd*/true);
 
     printk(KERN_WARNING "frag: The deed is done. pages=%llu\n", npages);
 
