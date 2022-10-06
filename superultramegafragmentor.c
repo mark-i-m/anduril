@@ -117,7 +117,7 @@ static struct proc_dir_entry *ent;
 static ssize_t profile_write(struct file *file, const char __user *ubuf,
                              size_t count, loff_t *ppos)
 {
-    size_t max_writen = MIN(PROFILE_STR_MAX - profile_str_n, count);
+    size_t max_writen = min(PROFILE_STR_MAX - profile_str_n, count);
     ssize_t ret;
 
     if ((ret = copy_from_user(&profile_str[*ppos], ubuf, max_writen))) {
@@ -133,7 +133,7 @@ static ssize_t profile_write(struct file *file, const char __user *ubuf,
 static ssize_t profile_read(struct file *file, char __user *ubuf,
                             size_t count, loff_t *ppos)
 {
-    size_t max_readn = MIN(profile_str_n - *ppos, count);
+    size_t max_readn = min(profile_str_n - *ppos, count);
     ssize_t ret;
 
     if (*ppos >= profile_str_n) {
@@ -149,10 +149,9 @@ static ssize_t profile_read(struct file *file, char __user *ubuf,
     return max_readn;
 }
 
-static struct file_operations profile_ops = {
-    .owner = THIS_MODULE,
-    .read = profile_read,
-    .write = profile_write,
+static const struct proc_ops profile_ops = {
+    .proc_read = profile_read,
+    .proc_write = profile_write,
 };
 
 ////////////////////////////////////////////////////////////////////////////////
