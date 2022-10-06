@@ -8,6 +8,7 @@
 #include <linux/prandom.h>
 #include <linux/shrinker.h>
 #include <linux/mm.h>
+#include <linux/proc_fs.h>
 
 MODULE_AUTHOR("Mark Mansi");
 MODULE_LICENSE("Dual MIT/GPL");
@@ -109,9 +110,50 @@ module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 // Profile to fragment memory with.
 #define PROFILE_STR_MAX 8192
 static char profile_str[PROFILE_STR_MAX];
+static size_t profile_str_n = 0;
 static struct profile *profile = NULL;
-module_param_string(profile, profile_str, PROFILE_STR_MAX,
-        S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+static struct proc_dir_entry *ent;
+
+static ssize_t profile_write(struct file *file, const char __user *ubuf,
+                             size_t count, loff_t *ppos)
+{
+    size_t max_writen = MIN(PROFILE_STR_MAX - profile_str_n, count);
+    ssize_t ret;
+
+    if ((ret = copy_from_user(&profile_str[*ppos], ubuf, max_writen))) {
+        return ret;
+    }
+
+    *ppos += max_writen;
+    profile_str_n = *ppos;
+
+    return count;
+}
+
+static ssize_t profile_read(struct file *file, char __user *ubuf,
+                            size_t count, loff_t *ppos)
+{
+    size_t max_readn = MIN(profile_str_n - *ppos, count);
+    ssize_t ret;
+
+    if (*ppos >= profile_str_n) {
+        return 0;
+    }
+
+    if ((ret = copy_to_user(ubuf, &profile_str[*ppos], max_readn))) {
+        return ret;
+    }
+
+    *ppos += max_readn;
+
+    return max_readn;
+}
+
+static struct file_operations profile_ops = {
+    .owner = THIS_MODULE,
+    .read = profile_read,
+    .write = profile_write,
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Parsing and building the profile graph.
@@ -781,6 +823,7 @@ static int mod_init(void) {
     printk(KERN_WARNING "frag: Init.\n");
 
     memset(profile_str, 0, PROFILE_STR_MAX);
+    ent = proc_create("sumf", 0660, NULL, &profile_ops);
 
     ret = register_shrinker(&frag_shrinker, "superultramegafragmentor");
     if (ret) return ret;
@@ -791,6 +834,8 @@ module_init(mod_init);
 
 static void mod_exit(void) {
     unregister_shrinker(&frag_shrinker);
+
+    proc_remove(ent);
 
     spin_lock(&allocation_lock);
     free_memory();
