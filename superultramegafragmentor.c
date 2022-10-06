@@ -109,15 +109,9 @@ module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 // Profile to fragment memory with.
 #define PROFILE_STR_MAX 8192
 static char profile_str[PROFILE_STR_MAX];
-static size_t profile_str_n = 0;
 static struct profile *profile = NULL;
-static int profile_set(const char *val, const struct kernel_param *kp);
-static int profile_get(char *buffer, const struct kernel_param *kp);
-static const struct kernel_param_ops profile_ops = {
-    .set = profile_set,
-    .get = profile_get,
-};
-module_param_cb(profile, &profile_ops, &profile, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+module_param_string(profile, profile_str, PROFILE_STR_MAX,
+        S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Parsing and building the profile graph.
@@ -202,8 +196,6 @@ static int profile_parse(void) {
         vfree(profile);
         profile = NULL;
     }
-
-    printk(KERN_WARNING "frag: \"%s\"\n", profile_str);
 
     // Count the number of nodes.
     for (i = 0; profile_str[i] != 0; ++i) {
@@ -353,70 +345,6 @@ err_out:
     profile = NULL;
 
     return ret;
-}
-
-// If `val` is empty, clear `profile_str`. Otherwise, append to the end of
-// `profile_str`. When the profile is `trigger`ed, it will be parsed and used.
-static int profile_set(const char *val, const struct kernel_param *kp) {
-    size_t val_len = strnlen(val, PROFILE_STR_MAX-1); // excludes null byte
-
-    // Clear existing profile if `val` is empty.
-    if (val_len == 0) {
-        profile_str_n = 0;
-        memset(profile_str, 0, PROFILE_STR_MAX);
-    }
-
-    // Check if there is enough space.
-    // profile_str_n is the position of the first NULL byte.
-    if (profile_str_n + val_len + 1 >= PROFILE_STR_MAX) {
-        return -ENOMEM;
-    }
-
-    strncpy(&profile_str[profile_str_n], val,
-            PROFILE_STR_MAX - profile_str_n - 1);
-    profile_str_n += val_len; // exclude NULL byte.
-    profile_str[profile_str_n] = '\0';
-
-    return 0;
-}
-
-static int profile_get(char *buffer, const struct kernel_param *kp) {
-    u64 i;
-    int len;
-    struct profile_node *node;
-    struct profile_edge *e;
-
-    // No profile loaded.
-    if (profile == NULL) {
-        return sprintf(buffer, "NULL\n");
-    }
-
-    // Profile loaded. Print a list of nodes first.
-    for (i = 0; i < profile->nnodes; ++i) {
-        node = &profile->nodes[i];
-
-        // printk(KERN_WARNING "frag: %llu %llu %llu\n", i, profile->nnodes, profile->nedges);
-
-        len += sprintf(buffer + len,
-                "%llu: size=%llu flags=%llx edges=",
-                i, node->order, node->flags);
-
-        buffer[len] = 0;
-
-        profile_for_each_edge(profile, node, e) {
-            len += sprintf(buffer + len,
-                    "(%llu %llu %llu) ",
-                    e->from, e->to, e->prob);
-        }
-
-        buffer[len] = 0;
-
-        len += sprintf(buffer + len, "\n");
-
-        buffer[len] = 0;
-    }
-
-    return len;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
