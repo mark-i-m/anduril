@@ -192,6 +192,9 @@ static int profile_parse(void) {
     struct profile_edge *edge;
     u64 discard, ecount = 0, prob_total, node_nedges;
 
+    printk(KERN_WARNING "frag: triggered len=%lu profile=\"%s\"\n",
+            profile_str_n, profile_str);
+
     // Free any existing profile.
     if (profile) {
         vfree(profile->nodes);
