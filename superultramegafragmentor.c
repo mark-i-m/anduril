@@ -133,7 +133,7 @@ static ssize_t profile_write(struct file *file, const char __user *ubuf,
 static ssize_t profile_read(struct file *file, char __user *ubuf,
                             size_t count, loff_t *ppos)
 {
-    size_t max_readn = min(profile_str_n - *ppos, count);
+    size_t max_readn = min(profile_str_n - ((size_t)*ppos), count);
     ssize_t ret;
 
     if (*ppos >= profile_str_n) {
