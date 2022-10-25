@@ -25,6 +25,11 @@ MODULE_LICENSE("Dual MIT/GPL");
 
 #define GFP_FLAGS (__GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)
 
+// In the MP, we need to represent probabilities using integers (because
+// floating point is not allowed in the kernel). To do this we represent a
+// probability p as `p * MP_GRANULARITY`.
+#define MP_GRANULARITY 1000
+
 // The profile graph.
 //
 // `struct profile` is the main data structure. It has a list of nodes and a
@@ -45,7 +50,8 @@ struct profile_edge {
     u64 from;
     u64 to;
 
-    // an int from 0 to 100 representing a probability that this edge is taken.
+    // an int from 0 to MP_GRANYLARITY representing a probability that this
+    // edge is taken.
     u64 prob;
 };
 
@@ -204,7 +210,8 @@ static int profile_parse_u64(
 //   F: flags (in hex).
 //   (T P)+: one or more outgoing edges.
 //      T: the index of the node on the other side of the edge.
-//      P: a u64 from 0 to 100 which is the probability of taking the edge.
+//      P: a u64 from 0 to MP_GRANULARITY which is the probability of taking
+//         the edge. The sum of outgoing edges should be ~MP_GRANULARITY.
 //      Don't actually write the ( ) + characters... I was using regex notation.
 //
 //  Example: "1 0 0 50 1 50;3 0 0 100;"
