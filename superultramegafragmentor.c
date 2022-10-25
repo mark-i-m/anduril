@@ -206,7 +206,7 @@ static int profile_parse_u64(
 //      S F (T P)+;
 //
 //   All elements are u64, space separated.
-//   S: size (in 4KB pages).
+//   S: order of the allocation (log(npages)).
 //   F: flags (in hex).
 //   (T P)+: one or more outgoing edges.
 //      T: the index of the node on the other side of the edge.
@@ -214,7 +214,7 @@ static int profile_parse_u64(
 //         the edge. The sum of outgoing edges should be ~MP_GRANULARITY.
 //      Don't actually write the ( ) + characters... I was using regex notation.
 //
-//  Example: "1 0 0 50 1 50;3 0 0 100;"
+//  Example: "1 0 0 50 1 50;3 0 0 1000;"
 //
 //        +---+
 //     .5 |   |  .5
