@@ -44,6 +44,11 @@ struct profile_node {
 
     // The index of the first outgoing edge from this node in the list of edges.
     u64 first_edge_idx;
+
+    // The total sum of probabilities of all outgoing edges. This should be
+    // close to `MP_GRANULARITY`, but because of rounding/truncation when
+    // converting to integers, it may be slightly less.
+    u64 edge_total;
 };
 
 struct profile_edge {
@@ -372,10 +377,13 @@ static int profile_parse(void) {
             prob_total += edge->prob;
         }
 
-        if (prob_total != 100) {
-            printk(KERN_ERR "frag: probabilities add to %llu != 100\n", prob_total);
+        if (prob_total > MP_GRANULARITY || prob_total < (MP_GRANULARITY * 3 / 4)) {
+            printk(KERN_ERR "frag: probabilities add to %llu != %d\n",
+                    prob_total, MP_GRANULARITY);
             goto err_out;
         }
+
+        node->edge_total = prob_total;
     }
 
     return 0;
@@ -579,13 +587,31 @@ u64 list_count(struct list_head *head) {
     return count;
 }
 
+// Take a random step in the profile MP from the `current` node.
+static struct profile_node *rand_mp_step(struct profile_node *current_node) {
+    struct profile_edge *selected_edge;
+
+    u64 rand = (prandom_u32() % current_node->edge_total) + 1;
+    u64 edge_idx = current_node->first_edge_idx;
+    u64 walk = profile->edges[edge_idx].prob;
+
+    while (walk < rand) {
+       edge_idx += 1;
+       walk = profile->edges[edge_idx].prob;
+    }
+
+    selected_edge = &profile->edges[edge_idx];
+
+    BUG_ON(selected_edge->from != profile_node_idx(profile, current_node));
+
+    return &profile->nodes[selected_edge->to];
+}
+
 // Allocate the memory. Then, do a random walk over the markov process until we
 // have fragmented all memory we allocated.
 static int do_fragment(void) {
     int ret;
-    struct profile_node *current_node, *n;
-    struct profile_edge *e;
-    u32 rand, walk;
+    struct profile_node *current_node;
     u64 pages_remaining = npages;
     struct list_head allocated_pages = LIST_HEAD_INIT(allocated_pages);
 
@@ -657,17 +683,7 @@ static int do_fragment(void) {
         }
 
         pages_remaining -= pages;
-
-        // Then, randomly walk to a neighbor.
-        rand = prandom_u32() % 100;
-        walk = 0;
-        profile_for_each_edge(profile, current_node, e) {
-            n = &profile->nodes[e->to];
-            walk += e->prob;
-            if (rand < walk) break;
-        }
-        //printk(KERN_WARNING "frag: rand=%u walk=%u\n", rand, walk);
-        current_node = n;
+        current_node = rand_mp_step(current_node);
     }
 
     // Randomize the lists. (We don't randomize pinned pages, though because
