@@ -39,7 +39,7 @@ MODULE_LICENSE("Dual MIT/GPL");
 // node B, and so on). There is no guarantee that they are sorted, though.
 
 struct profile_node {
-    u64 order;
+    u64 npages;
     u64 flags;
 
     // The index of the first outgoing edge from this node in the list of edges.
@@ -179,13 +179,14 @@ static const struct proc_ops profile_ops = {
 // Returns 0 if successful. Returns -1 if there is no token. Otherwise, returns
 // the return value of `kstrtoull`.
 static int profile_parse_u64(
-        const char **cursor, const char *end, unsigned int base, u64 *res)
+        const char **cursor, const char *end,
+        unsigned int base, u64 *res, char delimiter)
 {
     const char *tok_end;
     char tmp[40];
     int ret;
 
-    tok_end = strchr(*cursor, ' ');
+    tok_end = strchr(*cursor, delimiter);
     if (tok_end == NULL || tok_end > end) tok_end = end;
     if (*cursor >= tok_end) return -1;
 
@@ -208,10 +209,10 @@ static int profile_parse_u64(
 // - No trailing or separating whitespace except as below.
 // - The first node specified should be the source node.
 // - Each node has the following format:
-//      S F (T P)+;
+//      S|F (T P)+;
 //
 //   All elements are u64, space separated.
-//   S: order of the allocation (log(npages)).
+//   S: number of 4KB pages.
 //   F: flags (in hex).
 //   (T P)+: one or more outgoing edges.
 //      T: the index of the node on the other side of the edge.
@@ -219,7 +220,7 @@ static int profile_parse_u64(
 //         the edge. The sum of outgoing edges should be ~MP_GRANULARITY.
 //      Don't actually write the ( ) + characters... I was using regex notation.
 //
-//  Example: "1 0 0 50 1 50;3 0 0 1000;"
+//  Example: "1|0 0 50 1 50;3|0 0 1000;"
 //
 //        +---+
 //     .5 |   |  .5
@@ -281,7 +282,7 @@ static int profile_parse(void) {
         node = &profile->nodes[i++];
 
         // Parse size
-        ret = profile_parse_u64(&cursor, line_end, 10, &node->order);
+        ret = profile_parse_u64(&cursor, line_end, 10, &node->npages, '|');
         if (ret == -1) {
             printk(KERN_ERR "frag: expected size, found end of line\n");
             ret = -EINVAL;
@@ -292,7 +293,7 @@ static int profile_parse(void) {
         }
 
         // Parse flags
-        ret = profile_parse_u64(&cursor, line_end, 16, &node->flags);
+        ret = profile_parse_u64(&cursor, line_end, 16, &node->flags, ' ');
         if (ret == -1) {
             printk(KERN_ERR "frag: expected flags, found end of line\n");
             ret = -EINVAL;
@@ -307,7 +308,7 @@ static int profile_parse(void) {
 
         // Count edges...
         ecount = 0;
-        while ((ret = profile_parse_u64(&cursor, line_end, 10, &discard)) == 0) {
+        while ((ret = profile_parse_u64(&cursor, line_end, 10, &discard, ' ')) == 0) {
             //printk(KERN_WARNING "frag: discard=%llu\n", discard);
             ecount++;
         }
@@ -342,9 +343,9 @@ static int profile_parse(void) {
         node = &profile->nodes[i++];
 
         // Already did these.
-        ret = profile_parse_u64(&cursor, line_end, 10, &discard);
+        ret = profile_parse_u64(&cursor, line_end, 10, &discard, '|');
         BUG_ON(ret != 0);
-        ret = profile_parse_u64(&cursor, line_end, 16, &discard);
+        ret = profile_parse_u64(&cursor, line_end, 16, &discard, ' ');
         BUG_ON(ret != 0);
 
         prob_total = 0;
@@ -354,7 +355,7 @@ static int profile_parse(void) {
             edge = &profile->edges[j++];
             edge->from = profile_node_idx(profile, node);
 
-            ret = profile_parse_u64(&cursor, line_end, 10, &edge->to);
+            ret = profile_parse_u64(&cursor, line_end, 10, &edge->to, ' ');
             if (ret == -1) {
                 printk(KERN_ERR "frag: expected dest node, found end of line\n");
                 ret = -EINVAL;
@@ -364,7 +365,7 @@ static int profile_parse(void) {
                 goto err_out;
             }
 
-            ret = profile_parse_u64(&cursor, line_end, 10, &edge->prob);
+            ret = profile_parse_u64(&cursor, line_end, 10, &edge->prob, ' ');
             if (ret == -1) {
                 printk(KERN_ERR "frag: expected prob, found end of line\n");
                 ret = -EINVAL;
@@ -641,10 +642,10 @@ static int do_fragment(void) {
     // Start at node 0 and then walk randomly.
     current_node = &profile->nodes[0];
     while (!list_empty(&allocated_pages)) {
-        // Based on current_node, we want to remove `order` pages from
+        // Based on current_node, we want to remove `npages` pages from
         // `allocated_pages` and set them to the purpose indicated by `flags`.
         struct list_head assigned_pages = LIST_HEAD_INIT(assigned_pages);
-        u64 pages = min(pages_remaining, 1ull << current_node->order);
+        u64 pages = min(pages_remaining, current_node->npages);
         struct list_head *nth_entry = list_nth(&allocated_pages, pages - 1);
         list_cut_position(&assigned_pages, &allocated_pages, nth_entry);
 
