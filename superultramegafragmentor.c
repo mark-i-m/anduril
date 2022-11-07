@@ -119,7 +119,7 @@ static bool enable_shrinker = 0;
 module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
 // Profile to fragment memory with.
-#define PROFILE_STR_MAX 8192
+#define PROFILE_STR_MAX 2097152
 static char profile_str[PROFILE_STR_MAX];
 static size_t profile_str_n = 0;
 static struct profile *profile = NULL;
@@ -591,8 +591,9 @@ u64 list_count(struct list_head *head) {
 // Take a random step in the profile MP from the `current` node.
 static struct profile_node *rand_mp_step(struct profile_node *current_node) {
     struct profile_edge *selected_edge;
+    struct profile_node *next_node;
 
-    u64 rand = (prandom_u32() % current_node->edge_total) + 1;
+    u64 rand = (get_random_u64() % current_node->edge_total) + 1;
     u64 edge_idx = current_node->first_edge_idx;
     u64 walk = profile->edges[edge_idx].prob;
 
@@ -602,10 +603,12 @@ static struct profile_node *rand_mp_step(struct profile_node *current_node) {
     }
 
     selected_edge = &profile->edges[edge_idx];
+    next_node =  &profile->nodes[selected_edge->to];
 
     BUG_ON(selected_edge->from != profile_node_idx(profile, current_node));
+    BUG_ON(selected_edge->to != profile_node_idx(profile, next_node));
 
-    return &profile->nodes[selected_edge->to];
+    return next_node;
 }
 
 // Allocate the memory. Then, do a random walk over the markov process until we
