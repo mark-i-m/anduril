@@ -605,8 +605,18 @@ static struct profile_node *rand_mp_step(struct profile_node *current_node) {
     selected_edge = &profile->edges[edge_idx];
     next_node =  &profile->nodes[selected_edge->to];
 
-    BUG_ON(selected_edge->from != profile_node_idx(profile, current_node));
-    BUG_ON(selected_edge->to != profile_node_idx(profile, next_node));
+    if (unlikely(
+            selected_edge->from != profile_node_idx(profile, current_node) ||
+            selected_edge->to != profile_node_idx(profile, next_node)))
+    {
+        pr_err("pco: current_node=%lu next_node=%lu edge=%llu->%llu\n",
+                profile_node_idx(profile, current_node),
+                profile_node_idx(profile, next_node),
+                selected_edge->from,
+                selected_edge->to
+                );
+        BUG();
+    }
 
     return next_node;
 }
