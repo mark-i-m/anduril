@@ -599,7 +599,7 @@ static struct profile_node *rand_mp_step(struct profile_node *current_node) {
 
     while (walk < rand) {
        edge_idx += 1;
-       walk = profile->edges[edge_idx].prob;
+       walk += profile->edges[edge_idx].prob;
     }
 
     selected_edge = &profile->edges[edge_idx];
