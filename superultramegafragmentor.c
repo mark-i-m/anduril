@@ -788,7 +788,7 @@ static unsigned long
 frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
 
-    printk(KERN_WARNING "frag: shrinking...\n");
+    //printk(KERN_WARNING "frag: shrinking...\n");
 
     // Avoid deadlocks where we are trying to allocate and shrink at the same
     // time. We should only enable the shrinker after we are done allocating
