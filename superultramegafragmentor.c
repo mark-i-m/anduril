@@ -565,8 +565,8 @@ static void list_randomize(struct list_head *head, u64 npages) {
             cache.cache[cachen] = curr;
         }
 
-        if (i % 1000 == 0) {
-            printk(KERN_ERR "frag: rand %p %d\n", head, i);
+        if (i % (npages / 100) == 0) {
+            printk(KERN_ERR "frag: rand %p %d %lld%%\n", head, i, i * 100 / npages);
             cond_resched();
         }
 
