@@ -715,7 +715,7 @@ static int do_fragment(void) {
     set_page_flags(&pages_anon, /*lru*/false, /*priv*/true,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", npages_anon_thp);
-    list_randomize(&pages_anon_thp, npages_anon_thp);
+    //list_randomize(&pages_anon_thp, npages_anon_thp);
     set_page_flags(&pages_anon_thp, /*lru*/false, /*priv*/true,
                                     /*priv2*/true, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", npages_pinned);
