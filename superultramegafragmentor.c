@@ -70,16 +70,31 @@ struct profile {
     u64 nedges;
 };
 
-static u64 npages_total = 0;
-static u64 npages_pinned = 0;
-static u64 npages_anon = 0;
-static u64 npages_anon_thp = 0;
-static u64 npages_file = 0;
-static struct list_head pages_pinned = LIST_HEAD_INIT(pages_pinned);
-static struct list_head pages_anon = LIST_HEAD_INIT(pages_anon);
-static struct list_head pages_anon_thp = LIST_HEAD_INIT(pages_anon_thp);
-static struct list_head pages_file = LIST_HEAD_INIT(pages_file);
-static DEFINE_SPINLOCK(allocation_lock); // locks the lists above...
+// Pages on a single NUMA node of a single type.
+struct sumf_page_pool {
+    u64 npages;
+    struct list_head pages;
+};
+
+// Different types of memory usage. Used for indexing sumf_node_pools.pools.
+enum SUMF_LIST {
+    SUMF_PINNED = 0,
+    SUMF_ANON = 1,
+    SUMF_ANON_THP = 2,
+    SUMF_FILE = 3,
+
+    SUMF_NTYPES,
+};
+
+// A collection of pools of different types but all on the same NUMA node.
+struct sumf_node_pools {
+    u64 npages_total;
+    struct sumf_page_pool pools[SUMF_NTYPES];
+};
+
+// All pages taken from the kernel for sumf.
+static struct sumf_node_pools captured_pages[MAX_NUMNODES];
+static DEFINE_SPINLOCK(allocation_lock); // locks captured_pages
 
 // Given a node, find the index of that node.
 #define profile_node_idx(profile, node) ((node) - ((profile)->nodes))
@@ -854,13 +869,23 @@ static struct shrinker frag_shrinker = {
 // Module init/exit.
 
 static int mod_init(void) {
-    int ret;
+    int ret, nid, ty;
 
     printk(KERN_WARNING "frag: Init.\n");
 
+    // Init captured_pages
+    memset(&captured_pages, 0, sizeof(captured_pages));
+    for_each_node(nid) {
+        for (ty = 0; ty < SUMF_NTYPES; ++ty) {
+            INIT_LIST_HEAD(&captured_pages[nid].pools[ty].pages);
+        }
+    }
+
+    // Init sysfs interface.
     memset(profile_str, 0, PROFILE_STR_MAX);
     ent = proc_create("sumf", 0660, NULL, &profile_ops);
 
+    // Register shrinker to return memory.
     ret = register_shrinker(&frag_shrinker, "superultramegafragmentor");
     if (ret) return ret;
 
