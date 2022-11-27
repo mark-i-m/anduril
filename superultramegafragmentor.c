@@ -23,7 +23,8 @@ MODULE_LICENSE("Dual MIT/GPL");
 #define FLAGS_NONE (1 << 4)
 #define FLAGS_PINNED (1 << 5)
 
-#define GFP_FLAGS (__GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)
+#define GFP_FLAGS (__GFP_NORETRY | __GFP_HIGHMEM | \
+    __GFP_MOVABLE | __GFP_IO | __GFP_FS | __GFP_THISNODE)
 
 // In the MP, we need to represent probabilities using integers (because
 // floating point is not allowed in the kernel). To do this we represent a
@@ -88,13 +89,21 @@ enum SUMF_LIST {
 
 // A collection of pools of different types but all on the same NUMA node.
 struct sumf_node_pools {
-    u64 npages_total;
     struct sumf_page_pool pools[SUMF_NTYPES];
 };
 
 // All pages taken from the kernel for sumf.
 static struct sumf_node_pools captured_pages[MAX_NUMNODES];
 static DEFINE_SPINLOCK(allocation_lock); // locks captured_pages
+
+static u64 sumf_node_count_pages(struct sumf_node_pools *pools) {
+    u64 total = 0;
+    int ty;
+    for (ty = 0; ty < SUMF_NTYPES; ++ty) {
+        total += pools->pools[ty].npages;
+    }
+    return total;
+}
 
 // Given a node, find the index of that node.
 #define profile_node_idx(profile, node) ((node) - ((profile)->nodes))
@@ -421,7 +430,7 @@ err_out:
 
 // Allocate N pages with as much contiguity as possible, and add them to the
 // given list of pages.
-static int alloc_npages(u64 n, struct list_head *list) {
+static int alloc_npages(int nid, u64 n, struct list_head *list) {
     u64 alloced = 0;
     struct page *pages;
     u64 current_order;
@@ -429,7 +438,7 @@ static int alloc_npages(u64 n, struct list_head *list) {
 
     while (alloced < n) {
         current_order = min(MAX_ORDER - 1, ilog2(n - alloced));
-        pages = alloc_pages(GFP_FLAGS, current_order);
+        pages = alloc_pages_node(nid, GFP_FLAGS, current_order);
         split_page(pages, current_order);
 
         if (!pages) {
@@ -447,8 +456,6 @@ static int alloc_npages(u64 n, struct list_head *list) {
             cond_resched();
         }
     }
-
-    npages_total += alloced;
 
     return 0;
 }
@@ -491,6 +498,22 @@ static void free_all_pages(struct list_head *list) {
     while (!list_empty(list)) {
         free_first_page(list);
     }
+}
+
+static u64 free_pool(struct sumf_page_pool *pool) {
+    u64 npages = pool->npages;
+    free_all_pages(&pool->pages);
+    pool->npages = 0;
+    return npages;
+}
+
+static u64 free_node_pools(struct sumf_node_pools *pools) {
+    u64 npages = 0;
+    int ty;
+    for (ty = 0; ty < SUMF_NTYPES; ++ty) {
+        npages += free_pool(&pools->pools[ty]);
+    }
+    return npages;
 }
 
 #define CACHE_GRANULARITY 1000
@@ -549,7 +572,9 @@ static struct list_head *list_nth_with_cache(
 }
 
 // Randomize the given list.
-static void list_randomize(struct list_head *head, u64 npages) {
+static void pool_randomize(struct sumf_page_pool *pool) {
+    const u64 npages = pool->npages;
+    struct list_head *head = &pool->pages;
     struct list_head *curr = head->next, *prev = head, *second;
     u32 i = 0, rand;
     struct linked_list_cache cache = { };
@@ -638,11 +663,12 @@ static struct profile_node *rand_mp_step(struct profile_node *current_node) {
 
 // Allocate the memory. Then, do a random walk over the markov process until we
 // have fragmented all memory we allocated.
-static int do_fragment(void) {
+static int do_fragment(int nid, u64 npages) {
     int ret;
     struct profile_node *current_node;
     u64 pages_remaining = npages;
     struct list_head allocated_pages = LIST_HEAD_INIT(allocated_pages);
+    struct sumf_page_pool *pools = captured_pages[nid].pools;
 
     // Sanity check...
     if (!profile) {
@@ -659,7 +685,7 @@ static int do_fragment(void) {
     // Allocate the requested amount of memory. If the system was relatively
     // unfragmented before (e.g., after a fresh reboot), then we can expect the
     // pages in the list to be fairly contiguous and in order.
-    ret = alloc_npages(npages, &allocated_pages);
+    ret = alloc_npages(nid, npages, &allocated_pages);
     if (ret != 0) {
         printk(KERN_ERR "frag: error allocating: %d\n", ret);
         return ret;
@@ -680,24 +706,24 @@ static int do_fragment(void) {
         switch (current_node->flags) {
             case FLAGS_NONE:
             case FLAGS_PINNED:
-                list_splice_tail(&assigned_pages, pages_pinned.prev);
-                npages_pinned += pages;
+                list_splice_tail(&assigned_pages, pools[SUMF_PINNED].pages.prev);
+                pools[SUMF_PINNED].npages += pages;
                 break;
 
             case FLAGS_FILE:
-                list_splice_tail(&assigned_pages, pages_file.prev);
-                npages_file += pages;
+                list_splice_tail(&assigned_pages, pools[SUMF_FILE].pages.prev);
+                pools[SUMF_FILE].npages += pages;
                 break;
 
             case FLAGS_ANON:
-                list_splice_tail(&assigned_pages, pages_anon.prev);
-                npages_anon += pages;
+                list_splice_tail(&assigned_pages, pools[SUMF_ANON].pages.prev);
+                pools[SUMF_ANON].npages += pages;
                 break;
 
             case FLAGS_ANON_THP:
                 // TODO: make these actually be huge page aligned
-                list_splice_tail(&assigned_pages, pages_anon_thp.prev);
-                npages_anon_thp += pages;
+                list_splice_tail(&assigned_pages, pools[SUMF_ANON_THP].pages.prev);
+                pools[SUMF_ANON_THP].npages += pages;
                 break;
 
             case FLAGS_BUDDY:
@@ -721,23 +747,23 @@ static int do_fragment(void) {
     // We also set some flags on each page to indicate which category the page
     // is in when we use the kpfsnapshot tool. The set of flags for each
     // category is arbitrary -- they just need to be different.
-    printk(KERN_WARNING "frag: Randomize file pages. pages=%llu\n", npages_file);
-    list_randomize(&pages_file, npages_file);
-    set_page_flags(&pages_file, /*lru*/true, /*priv*/false,
+    printk(KERN_WARNING "frag: Randomize file pages. pages=%llu\n", pools[SUMF_FILE].npages);
+    pool_randomize(&pools[SUMF_FILE]);
+    set_page_flags(&pools[SUMF_FILE].pages, /*lru*/true, /*priv*/false,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
-    printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", npages_anon);
-    list_randomize(&pages_anon, npages_anon);
-    set_page_flags(&pages_anon, /*lru*/false, /*priv*/true,
+    printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", pools[SUMF_ANON].npages);
+    pool_randomize(&pools[SUMF_ANON]);
+    set_page_flags(&pools[SUMF_ANON].pages, /*lru*/false, /*priv*/true,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
-    printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", npages_anon_thp);
-    //list_randomize(&pages_anon_thp, npages_anon_thp);
-    set_page_flags(&pages_anon_thp, /*lru*/false, /*priv*/true,
+    printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", pools[SUMF_ANON_THP].npages);
+    //pool_randomize(&pools[SUMF_ANON_THP]);
+    set_page_flags(&pools[SUMF_ANON_THP].pages, /*lru*/false, /*priv*/true,
                                     /*priv2*/true, /*opriv*/true, /*rsvd*/true);
-    printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", npages_pinned);
-    set_page_flags(&pages_pinned, /*lru*/false, /*priv*/false,
+    printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", pools[SUMF_PINNED].npages);
+    set_page_flags(&pools[SUMF_PINNED].pages, /*lru*/false, /*priv*/false,
                                   /*priv2*/false, /*opriv*/true, /*rsvd*/true);
 
-    printk(KERN_WARNING "frag: The deed is done. pages=%llu\n", npages);
+    printk(KERN_WARNING "frag: The deed is done. (node %d) pages=%llu\n", nid, npages);
 
     return 0;
 
@@ -747,21 +773,20 @@ free_and_error:
 }
 
 static void free_memory(void) {
-    free_all_pages(&pages_anon);
-    free_all_pages(&pages_anon_thp);
-    free_all_pages(&pages_file);
-    free_all_pages(&pages_pinned);
+    u64 total = 0;
+    int nid;
 
-    printk(KERN_WARNING "frag: Freed %llu pages.\n", npages_total);
+    for (nid = 0; nid < MAX_NUMNODES; ++nid) {
+        total += free_node_pools(&captured_pages[nid]);
+    }
 
-    npages_total = 0;
-    npages_anon = 0;
-    npages_anon_thp = 0;
-    npages_file = 0;
-    npages_pinned = 0;
+    printk(KERN_WARNING "frag: Freed %llu pages.\n", total);
 }
 
 static int trigger_set(const char *val, const struct kernel_param *kp) {
+    int nnodes, nid;
+    u64 split_npages;
+
     // Parse value.
     int ret = param_set_int(val, kp);
     if (ret != 0) return ret;
@@ -775,7 +800,19 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
     // Trigger fragmentation.
     if (trigger == 1) {
-        ret = do_fragment();
+        // Assume all nodes are the same size and split the quota of pages
+        // equally among them.
+        nnodes = num_online_nodes();
+        split_npages = npages / nnodes;
+
+        for_each_online_node(nid) {
+            ret = do_fragment(nid, split_npages);
+            if (ret != 0) {
+                printk(KERN_WARNING
+                    "frag: unable to fragment all nodes. nid=%d\n", nid);
+                break;
+            }
+        }
     } else if (trigger == 2) {
         free_memory();
     } else {
@@ -795,13 +832,16 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
 static unsigned long
 frag_shrink_count(struct shrinker *shrink, struct shrink_control *sc) {
-    return enable_shrinker ? npages_total : 0;
+    return enable_shrinker
+        ? sumf_node_count_pages(&captured_pages[sc->nid])
+        : 0;
 }
 
 // Free a random subset of `nr_to_scan` pages.
 static unsigned long
 frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
+    struct sumf_page_pool *pools = captured_pages[sc->nid].pools;
 
     //printk(KERN_WARNING "frag: shrinking...\n");
 
@@ -817,14 +857,16 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
 
     // Figure out what we will reclaim. Initially we want to reclaim file
     // memory and single anon pages. Then we will break apart THP pages.
-    while ((npages_file > 0 || npages_anon > 0 || npages_anon_thp > 0)
+    while ((pools[SUMF_FILE].npages > 0
+                || pools[SUMF_ANON].npages > 0
+                || pools[SUMF_ANON_THP].npages > 0)
             && freed < sc->nr_to_scan)
     {
         switch (prandom_u32() % 2) {
             case 0: // file
-                if (npages_file > 0) {
-                    free_first_page(&pages_file);
-                    npages_file -= 1;
+                if (pools[SUMF_FILE].npages > 0) {
+                    free_first_page(&pools[SUMF_FILE].pages);
+                    pools[SUMF_FILE].npages -= 1;
                     freed += 1;
                     break;
                 }
@@ -832,9 +874,9 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
                 // if we don't have file pages.
 
             case 1: // anon
-                if (npages_anon > 0) {
-                    free_first_page(&pages_anon);
-                    npages_anon -= 1;
+                if (pools[SUMF_ANON].npages > 0) {
+                    free_first_page(&pools[SUMF_ANON].pages);
+                    pools[SUMF_ANON].npages -= 1;
                     freed += 1;
                     break;
                 }
@@ -843,9 +885,9 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
 
             case 2: // anon thp -- will never happen on it's own. Only happens
                     // by fall-through.
-                if (npages_anon_thp > 0) {
-                    free_first_page(&pages_anon_thp);
-                    npages_anon_thp -= 1;
+                if (pools[SUMF_ANON_THP].npages > 0) {
+                    free_first_page(&pools[SUMF_ANON_THP].pages);
+                    pools[SUMF_ANON_THP].npages -= 1;
                     freed += 1;
                 }
                 break;
@@ -875,7 +917,7 @@ static int mod_init(void) {
 
     // Init captured_pages
     memset(&captured_pages, 0, sizeof(captured_pages));
-    for_each_node(nid) {
+    for (nid = 0; nid < MAX_NUMNODES; ++nid) {
         for (ty = 0; ty < SUMF_NTYPES; ++ty) {
             INIT_LIST_HEAD(&captured_pages[nid].pools[ty].pages);
         }

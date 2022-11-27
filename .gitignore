@@ -5,6 +5,7 @@ superultramegafragmentor.mod
 superultramegafragmentor.mod.c
 superultramegafragmentor.mod.o
 superultramegafragmentor.o
+.superultramegafragmentor.o.d
 .superultramegafragmentor.ko.cmd
 .superultramegafragmentor.mod.cmd
 .superultramegafragmentor.mod.o.cmd
