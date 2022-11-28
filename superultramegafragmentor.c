@@ -73,7 +73,7 @@ struct profile {
 
 // Pages on a single NUMA node of a single type.
 struct sumf_page_pool {
-    u64 npages;
+    u64 npages; // always base pages, even if the pages in `pages` are high-order...
     struct list_head pages;
 };
 
@@ -428,27 +428,109 @@ err_out:
 ////////////////////////////////////////////////////////////////////////////////
 // The Meat.
 
-// Allocate N pages with as much contiguity as possible, and add them to the
-// given list of pages.
-static int alloc_npages(int nid, u64 n, struct list_head *list) {
-    u64 alloced = 0;
+#define ALLOC_ORDER HPAGE_SHIFT
+
+// Get the `n`th element of the list, or the last element if there are fewer
+// than `n` elements left. If the list is empty, return null.
+static struct list_head *list_nth(struct list_head *head, u64 n) {
+    struct list_head *elem = head->next;
+
+    if (list_empty(head)) return NULL;
+
+    while (n-- > 0 && !list_is_last(elem, head)) {
+        elem = elem->next;
+    }
+
+    return elem;
+}
+
+struct allocated_unsplit_pages {
+    // Any unsplit (order ALLOC_ORDER) pages we have allocated. Initially, they
+    // are all in this list.
+    struct list_head unsplit;
+
+    // The any pages that has already been split.
+    struct list_head split;
+    u64 nsplit;
+};
+
+static void init_allocated_unsplit_pages(struct allocated_unsplit_pages *aup) {
+    INIT_LIST_HEAD(&aup->unsplit);
+    INIT_LIST_HEAD(&aup->split);
+    aup->nsplit = 0;
+}
+
+// Take `n` base pages worth of unsplit pages, rounding down to the next unsplit page.
+// The pages are returned unsplit.
+//
+// If there are not `n` pages remaining, all remaining pages are returned.
+static void take_unsplit_pages(u64 n,
+        struct allocated_unsplit_pages *aup, struct list_head *assigned)
+{
+    const u64 nhighorder = n >> ALLOC_ORDER;
+    struct list_head *nth_entry = list_nth(&aup->unsplit, nhighorder - 1);
+    list_cut_position(assigned, &aup->unsplit, nth_entry);
+}
+
+// Return `n` base pages already split. Or if there are not `n` pages
+// remaining, return all remaining pages.
+static void take_and_split_pages(u64 n,
+        struct allocated_unsplit_pages *aup, struct list_head *assigned)
+{
+    u64 nassigned = 0, nsplit;
+    struct list_head *nth_entry, *next_unsplit;
     struct page *pages;
-    u64 current_order;
     int i;
 
-    while (alloced < n) {
-        current_order = min(MAX_ORDER - 1, ilog2(n - alloced));
-        pages = alloc_pages_node(nid, GFP_FLAGS, current_order);
-        split_page(pages, current_order);
+    while (true) {
+        // Take as many pages as we can that are already split.
+        nsplit = min(aup->nsplit, n);
+        nth_entry = list_nth(&aup->split, n - 1);
+        list_cut_position(assigned, &aup->split, nth_entry);
+        nassigned += nsplit;
+        aup->nsplit -= nsplit;
 
+        // Check if we are done.
+        if (nassigned == n) {
+            return;
+        }
+
+        // There are no more split pages; split a new unsplit page.
+        BUG_ON(!list_empty(&aup->split));
+        if (list_empty(&aup->unsplit)) {
+            // Out of pages...
+            return;
+        }
+
+        // Split...
+        next_unsplit = aup->unsplit.next;
+        list_del(next_unsplit);
+        pages = list_entry(next_unsplit, struct page, lru);
+        split_page(pages, ALLOC_ORDER);
+        for (i = 0; i < (1 << ALLOC_ORDER); ++i) {
+            list_add_tail(&pages[i].lru, &aup->split);
+            aup->nsplit += 1;
+        }
+    }
+}
+
+static bool aup_empty(struct allocated_unsplit_pages *aup) {
+    return list_empty(&aup->unsplit) && (aup->nsplit == 0);
+}
+
+// Allocate >=N pages with as much contiguity as possible, and add them to the
+// given list of pages without splitting them.
+static int alloc_npages(int nid, u64 n, struct allocated_unsplit_pages *aup) {
+    u64 alloced = 0;
+    struct page *pages;
+
+    while (alloced < n) {
+        pages = alloc_pages_node(nid, GFP_FLAGS, ALLOC_ORDER);
         if (!pages) {
             return -ENOMEM;
         } else {
-            for (i = 0; i < (1 << current_order); ++i) {
-                list_add_tail(&pages[i].lru, list);
-            }
-
-            alloced += 1 << current_order;
+            list_add_tail(&pages->lru, &aup->unsplit);
+            alloced += 1 << ALLOC_ORDER;
         }
 
         // Let the scheduler know we haven't deadlocked.
@@ -474,7 +556,7 @@ static void set_page_flags(struct list_head *list, bool lru,
 }
 
 // Free the first page of the list or do nothing if the list is empty.
-static inline void free_first_page(struct list_head *list) {
+static inline void free_first_page(struct list_head *list, u64 order) {
     if (!list_empty(list)) {
         // remove from list.
         struct page *p = list_first_entry(list, struct page, lru);
@@ -489,20 +571,26 @@ static inline void free_first_page(struct list_head *list) {
         ClearPageReserved(p);
 
         // free the page back to the buddy allocator.
-        __free_pages(p, 0);
+        __free_pages(p, order);
     }
 }
 
 // Free all pages on the given list.
-static void free_all_pages(struct list_head *list) {
+static void free_all_pages(struct list_head *list, u64 order) {
     while (!list_empty(list)) {
-        free_first_page(list);
+        free_first_page(list, order);
     }
 }
 
-static u64 free_pool(struct sumf_page_pool *pool) {
+static void free_aup(struct allocated_unsplit_pages *aup) {
+    free_all_pages(&aup->split, 0);
+    aup->nsplit = 0;
+    free_all_pages(&aup->unsplit, ALLOC_ORDER);
+}
+
+static u64 free_pool(struct sumf_page_pool *pool, u64 order) {
     u64 npages = pool->npages;
-    free_all_pages(&pool->pages);
+    free_all_pages(&pool->pages, order);
     pool->npages = 0;
     return npages;
 }
@@ -511,9 +599,21 @@ static u64 free_node_pools(struct sumf_node_pools *pools) {
     u64 npages = 0;
     int ty;
     for (ty = 0; ty < SUMF_NTYPES; ++ty) {
-        npages += free_pool(&pools->pools[ty]);
+        npages += free_pool(&pools->pools[ty],
+                ty == SUMF_ANON_THP ? HPAGE_SHIFT : 0);
     }
     return npages;
+}
+
+static void free_memory(void) {
+    u64 total = 0;
+    int nid;
+
+    for (nid = 0; nid < MAX_NUMNODES; ++nid) {
+        total += free_node_pools(&captured_pages[nid]);
+    }
+
+    printk(KERN_WARNING "frag: Freed %llu pages.\n", total);
 }
 
 #define CACHE_GRANULARITY 1000
@@ -524,20 +624,6 @@ struct linked_list_cache {
     // The number of elements in the cache.
     u64 length;
 };
-
-// Get the `n`th element of the list, or the last element if there are fewer
-// than `n` elements left. If the list is empty, return null.
-static struct list_head *list_nth(struct list_head *head, u64 n) {
-    struct list_head *elem = head->next;
-
-    if (list_empty(head)) return NULL;
-
-    while (n-- > 0 && !list_is_last(elem, head)) {
-        elem = elem->next;
-    }
-
-    return elem;
-}
 
 static inline void list_mk_cache(
         struct linked_list_cache *cache,
@@ -607,6 +693,10 @@ static void pool_randomize(struct sumf_page_pool *pool) {
 
         if (i % (npages / 100) == 0) {
             printk(KERN_ERR "frag: rand %p %d %lld%%\n", head, i, i * 100 / npages);
+        }
+
+        // Let the scheduler know we haven't deadlocked...
+        if (i % 500 == 0) {
             cond_resched();
         }
 
@@ -667,8 +757,9 @@ static int do_fragment(int nid, u64 npages) {
     int ret;
     struct profile_node *current_node;
     u64 pages_remaining = npages;
-    struct list_head allocated_pages = LIST_HEAD_INIT(allocated_pages);
+    struct allocated_unsplit_pages aup;
     struct sumf_page_pool *pools = captured_pages[nid].pools;
+    struct list_head assigned_pages;
 
     // Sanity check...
     if (!profile) {
@@ -685,7 +776,8 @@ static int do_fragment(int nid, u64 npages) {
     // Allocate the requested amount of memory. If the system was relatively
     // unfragmented before (e.g., after a fresh reboot), then we can expect the
     // pages in the list to be fairly contiguous and in order.
-    ret = alloc_npages(nid, npages, &allocated_pages);
+    init_allocated_unsplit_pages(&aup);
+    ret = alloc_npages(nid, npages, &aup);
     if (ret != 0) {
         printk(KERN_ERR "frag: error allocating: %d\n", ret);
         return ret;
@@ -695,43 +787,40 @@ static int do_fragment(int nid, u64 npages) {
     // Fragment the memory by doing a random walk over the profile.
     // Start at node 0 and then walk randomly.
     current_node = &profile->nodes[0];
-    while (!list_empty(&allocated_pages)) {
+    while (!aup_empty(&aup)) {
         // Based on current_node, we want to remove `npages` pages from
         // `allocated_pages` and set them to the purpose indicated by `flags`.
-        struct list_head assigned_pages = LIST_HEAD_INIT(assigned_pages);
         u64 pages = min(pages_remaining, current_node->npages);
-        struct list_head *nth_entry = list_nth(&allocated_pages, pages - 1);
-        list_cut_position(&assigned_pages, &allocated_pages, nth_entry);
 
         switch (current_node->flags) {
             case FLAGS_NONE:
             case FLAGS_PINNED:
-                list_splice_tail(&assigned_pages, pools[SUMF_PINNED].pages.prev);
+                take_and_split_pages(pages, &aup, pools[SUMF_PINNED].pages.prev);
                 pools[SUMF_PINNED].npages += pages;
                 break;
 
             case FLAGS_FILE:
-                list_splice_tail(&assigned_pages, pools[SUMF_FILE].pages.prev);
+                take_and_split_pages(pages, &aup, pools[SUMF_FILE].pages.prev);
                 pools[SUMF_FILE].npages += pages;
                 break;
 
             case FLAGS_ANON:
-                list_splice_tail(&assigned_pages, pools[SUMF_ANON].pages.prev);
+                take_and_split_pages(pages, &aup, pools[SUMF_ANON].pages.prev);
                 pools[SUMF_ANON].npages += pages;
                 break;
 
             case FLAGS_ANON_THP:
-                // TODO: make these actually be huge page aligned
-                list_splice_tail(&assigned_pages, pools[SUMF_ANON_THP].pages.prev);
+                take_unsplit_pages(pages, &aup, pools[SUMF_ANON_THP].pages.prev);
                 pools[SUMF_ANON_THP].npages += pages;
                 break;
 
             case FLAGS_BUDDY:
-                free_all_pages(&assigned_pages);
+                INIT_LIST_HEAD(&assigned_pages);
+                take_and_split_pages(pages, &aup, &assigned_pages);
+                free_all_pages(&assigned_pages, 0);
                 break;
 
             default:
-                free_all_pages(&assigned_pages);
                 ret = -EINVAL;
                 printk(KERN_ERR "frag: unrecognized flags: %llx\n", current_node->flags);
                 goto free_and_error;
@@ -768,19 +857,9 @@ static int do_fragment(int nid, u64 npages) {
     return 0;
 
 free_and_error:
-    free_all_pages(&allocated_pages);
+    free_aup(&aup);
+    free_memory();
     return ret;
-}
-
-static void free_memory(void) {
-    u64 total = 0;
-    int nid;
-
-    for (nid = 0; nid < MAX_NUMNODES; ++nid) {
-        total += free_node_pools(&captured_pages[nid]);
-    }
-
-    printk(KERN_WARNING "frag: Freed %llu pages.\n", total);
 }
 
 static int trigger_set(const char *val, const struct kernel_param *kp) {
@@ -865,7 +944,7 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
         switch (prandom_u32() % 2) {
             case 0: // file
                 if (pools[SUMF_FILE].npages > 0) {
-                    free_first_page(&pools[SUMF_FILE].pages);
+                    free_first_page(&pools[SUMF_FILE].pages, 0);
                     pools[SUMF_FILE].npages -= 1;
                     freed += 1;
                     break;
@@ -875,7 +954,7 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
 
             case 1: // anon
                 if (pools[SUMF_ANON].npages > 0) {
-                    free_first_page(&pools[SUMF_ANON].pages);
+                    free_first_page(&pools[SUMF_ANON].pages, 0);
                     pools[SUMF_ANON].npages -= 1;
                     freed += 1;
                     break;
@@ -886,9 +965,9 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
             case 2: // anon thp -- will never happen on it's own. Only happens
                     // by fall-through.
                 if (pools[SUMF_ANON_THP].npages > 0) {
-                    free_first_page(&pools[SUMF_ANON_THP].pages);
-                    pools[SUMF_ANON_THP].npages -= 1;
-                    freed += 1;
+                    free_first_page(&pools[SUMF_ANON_THP].pages, ALLOC_ORDER);
+                    pools[SUMF_ANON_THP].npages -= 1 << ALLOC_ORDER;
+                    freed += 1 << ALLOC_ORDER;
                 }
                 break;
 
