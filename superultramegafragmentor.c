@@ -468,8 +468,11 @@ static void take_unsplit_pages(u64 n,
         struct allocated_unsplit_pages *aup, struct list_head *assigned)
 {
     const u64 nhighorder = n >> ALLOC_ORDER;
+    LIST_HEAD(tmp);
+
     struct list_head *nth_entry = list_nth(&aup->unsplit, nhighorder - 1);
-    list_cut_position(assigned, &aup->unsplit, nth_entry);
+    list_cut_position(&tmp, &aup->unsplit, nth_entry);
+    list_splice_tail(&tmp, assigned->prev);
 }
 
 // Return `n` base pages already split. Or if there are not `n` pages
@@ -479,6 +482,7 @@ static void take_and_split_pages(u64 n,
 {
     u64 nassigned = 0, nsplit;
     struct list_head *nth_entry, *next_unsplit;
+    LIST_HEAD(tmp);
     struct page *pages;
     int i;
 
@@ -486,7 +490,8 @@ static void take_and_split_pages(u64 n,
         // Take as many pages as we can that are already split.
         nsplit = min(aup->nsplit, n);
         nth_entry = list_nth(&aup->split, n - 1);
-        list_cut_position(assigned, &aup->split, nth_entry);
+        list_cut_position(&tmp, &aup->split, nth_entry);
+        list_splice_tail_init(&tmp, assigned->prev);
         nassigned += nsplit;
         aup->nsplit -= nsplit;
 
