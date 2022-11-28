@@ -9,6 +9,8 @@ obj-m := superultramegafragmentor.o
 
 .PHONY: all clean
 
+KBUILD_CFLAGS += -Wimplicit-fallthrough=3
+
 all:
 	make -C $(KPATH) M=$(CURDIR) modules
 
