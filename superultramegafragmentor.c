@@ -766,6 +766,8 @@ static int do_fragment(int nid, u64 npages) {
     struct sumf_page_pool *pools = captured_pages[nid].pools;
     struct list_head assigned_pages;
 
+    init_allocated_unsplit_pages(&aup);
+
     // Sanity check...
     if (!profile) {
         printk(KERN_ERR "frag: no profile\n");
@@ -781,7 +783,6 @@ static int do_fragment(int nid, u64 npages) {
     // Allocate the requested amount of memory. If the system was relatively
     // unfragmented before (e.g., after a fresh reboot), then we can expect the
     // pages in the list to be fairly contiguous and in order.
-    init_allocated_unsplit_pages(&aup);
     ret = alloc_npages(nid, npages, &aup);
     if (ret != 0) {
         printk(KERN_ERR "frag: error allocating: %d\n", ret);
