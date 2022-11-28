@@ -428,7 +428,7 @@ err_out:
 ////////////////////////////////////////////////////////////////////////////////
 // The Meat.
 
-#define ALLOC_ORDER HPAGE_SHIFT
+#define ALLOC_ORDER (HPAGE_SHIFT - PAGE_SHIFT)
 
 // Get the `n`th element of the list, or the last element if there are fewer
 // than `n` elements left. If the list is empty, return null.
