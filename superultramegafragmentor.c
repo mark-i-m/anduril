@@ -488,12 +488,14 @@ static void take_and_split_pages(u64 n,
 
     while (true) {
         // Take as many pages as we can that are already split.
-        nsplit = min(aup->nsplit, n);
-        nth_entry = list_nth(&aup->split, n - 1);
-        list_cut_position(&tmp, &aup->split, nth_entry);
-        list_splice_tail_init(&tmp, assigned->prev);
-        nassigned += nsplit;
-        aup->nsplit -= nsplit;
+        nsplit = min(aup->nsplit, n - nassigned);
+        if (nsplit > 0) {
+            nth_entry = list_nth(&aup->split, n - 1);
+            list_cut_position(&tmp, &aup->split, nth_entry);
+            list_splice_tail_init(&tmp, assigned->prev);
+            nassigned += nsplit;
+            aup->nsplit -= nsplit;
+        }
 
         // Check if we are done.
         if (nassigned == n) {
@@ -524,12 +526,13 @@ static bool aup_empty(struct allocated_unsplit_pages *aup) {
 }
 
 // Allocate >=N pages with as much contiguity as possible, and add them to the
-// given list of pages without splitting them.
-static int alloc_npages(int nid, u64 n, struct allocated_unsplit_pages *aup) {
+// given list of pages without splitting them. Update `n` with actual number
+// allocated.
+static int alloc_npages(int nid, u64 *n, struct allocated_unsplit_pages *aup) {
     u64 alloced = 0;
     struct page *pages;
 
-    while (alloced < n) {
+    while (alloced < *n) {
         pages = alloc_pages_node(nid, GFP_FLAGS, ALLOC_ORDER);
         if (!pages) {
             return -ENOMEM;
@@ -543,6 +546,8 @@ static int alloc_npages(int nid, u64 n, struct allocated_unsplit_pages *aup) {
             cond_resched();
         }
     }
+
+    *n = alloced;
 
     return 0;
 }
@@ -668,6 +673,15 @@ static struct list_head *list_nth_with_cache(
     return list_nth(cache->cache[cachen]->prev, remainder);
 }
 
+static u64 list_count(struct list_head *list) {
+    u64 count = 0;
+    struct list_head *it;
+    list_for_each(it, list) {
+        count += 1;
+    }
+    return count;
+}
+
 // Randomize the given list.
 static void pool_randomize(struct sumf_page_pool *pool) {
     const u64 npages = pool->npages;
@@ -702,7 +716,7 @@ static void pool_randomize(struct sumf_page_pool *pool) {
             cache.cache[cachen] = curr;
         }
 
-        if (i % (npages / 100) == 0) {
+        if (npages < 100 || i % (npages / 100) == 0) {
             printk(KERN_ERR "frag: rand %p %d %lld%%\n", head, i, i * 100 / npages);
         }
 
@@ -716,17 +730,6 @@ static void pool_randomize(struct sumf_page_pool *pool) {
         curr = prev->next;
         i += 1;
     }
-}
-
-u64 list_count(struct list_head *head) {
-    u64 count = 0;
-    struct list_head *elem;
-
-    list_for_each(elem, head) {
-        count += 1;
-    }
-
-    return count;
 }
 
 // Take a random step in the profile MP from the `current` node.
@@ -767,10 +770,10 @@ static struct profile_node *rand_mp_step(struct profile_node *current_node) {
 static int do_fragment(int nid, u64 npages) {
     int ret;
     struct profile_node *current_node;
-    u64 pages_remaining = npages;
+    u64 pages_remaining;
     struct allocated_unsplit_pages aup;
     struct sumf_page_pool *pools = captured_pages[nid].pools;
-    struct list_head assigned_pages;
+    struct list_head pages_to_free;
 
     init_allocated_unsplit_pages(&aup);
 
@@ -789,7 +792,8 @@ static int do_fragment(int nid, u64 npages) {
     // Allocate the requested amount of memory. If the system was relatively
     // unfragmented before (e.g., after a fresh reboot), then we can expect the
     // pages in the list to be fairly contiguous and in order.
-    ret = alloc_npages(nid, npages, &aup);
+    ret = alloc_npages(nid, &npages, &aup);
+    pages_remaining = npages;
     if (ret != 0) {
         printk(KERN_ERR "frag: error allocating: %d\n", ret);
         return ret;
@@ -827,9 +831,9 @@ static int do_fragment(int nid, u64 npages) {
                 break;
 
             case FLAGS_BUDDY:
-                INIT_LIST_HEAD(&assigned_pages);
-                take_and_split_pages(pages, &aup, &assigned_pages);
-                free_all_pages(&assigned_pages, 0);
+                INIT_LIST_HEAD(&pages_to_free);
+                take_and_split_pages(pages, &aup, &pages_to_free);
+                free_all_pages(&pages_to_free, 0);
                 break;
 
             default:
