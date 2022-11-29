@@ -622,6 +622,7 @@ static void free_memory(void) {
 }
 
 #define CACHE_GRANULARITY 1000
+#define CACHE_MEM_PREALLOC_N (256 << 10)
 
 struct linked_list_cache {
     // The first element in the cache array.
@@ -634,14 +635,19 @@ static inline void list_mk_cache(
         struct linked_list_cache *cache,
         struct list_head *head, u64 n)
 {
+    // Preallocating the array as a static here allows us to avoid OOM
+    // situations due to trying to allocate the cache after we have already
+    // called alloc_npages.
+    static struct list_head* cache_mem_prealloc[CACHE_MEM_PREALLOC_N];
+
     struct list_head *elem;
     u64 i = 0;
 
     printk(KERN_WARNING "frag: building cache...\n");
 
     cache->length = n / CACHE_GRANULARITY;
-    cache->cache = vmalloc(cache->length * sizeof(struct page*));
-    BUG_ON(cache->cache == NULL); // Hopefully won't happen often.
+    BUG_ON(cache->length > CACHE_MEM_PREALLOC_N);
+    cache->cache = cache_mem_prealloc;
 
     list_for_each(elem, head) {
         if (i % CACHE_GRANULARITY == 0) {
