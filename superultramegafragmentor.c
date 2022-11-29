@@ -142,6 +142,18 @@ module_param(npages, ullong, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 static bool enable_shrinker = 0;
 module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
+// Stats about how many pages were shrunk.
+static u64 stats_nshrunk = 0;
+module_param(stats_nshrunk, ullong, S_IRUSR | S_IRGRP | S_IROTH);
+
+// Stats about how many pages were actually allocated initially.
+static u64 stats_nactual_alloc = 0;
+module_param(stats_nactual_alloc, ullong, S_IRUSR | S_IRGRP | S_IROTH);
+
+// Stats about how many pages were freed initially.
+static u64 stats_nfree_initially = 0;
+module_param(stats_nfree_initially, ullong, S_IRUSR | S_IRGRP | S_IROTH);
+
 // Profile to fragment memory with.
 #define PROFILE_STR_MAX 2097152
 static char profile_str[PROFILE_STR_MAX];
@@ -799,6 +811,7 @@ static int do_fragment(int nid, u64 npages) {
         return ret;
     }
     printk(KERN_WARNING "frag: done allocating %llu pages\n", npages);
+    stats_nactual_alloc = npages;
 
     // Fragment the memory by doing a random walk over the profile.
     // Start at node 0 and then walk randomly.
@@ -834,6 +847,8 @@ static int do_fragment(int nid, u64 npages) {
                 INIT_LIST_HEAD(&pages_to_free);
                 take_and_split_pages(pages, &aup, &pages_to_free);
                 free_all_pages(&pages_to_free, 0);
+                stats_nfree_initially += pages;
+                //printk(KERN_WARNING "frag: B %llu\n", pages);
                 break;
 
             default:
@@ -994,6 +1009,8 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     }
 
     spin_unlock(&allocation_lock);
+
+    stats_nshrunk += freed;
 
     return freed;
 }
