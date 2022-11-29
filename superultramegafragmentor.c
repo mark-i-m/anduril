@@ -996,6 +996,7 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
 static struct shrinker frag_shrinker = {
     .count_objects = frag_shrink_count,
     .scan_objects = frag_shrink_scan,
+    .flags = SHRINKER_NUMA_AWARE,
 };
 
 ////////////////////////////////////////////////////////////////////////////////
