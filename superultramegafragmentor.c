@@ -456,6 +456,15 @@ static struct list_head *list_nth(struct list_head *head, u64 n) {
     return elem;
 }
 
+static u64 list_count(struct list_head *list) {
+    u64 count = 0;
+    struct list_head *it;
+    list_for_each(it, list) {
+        count += 1;
+    }
+    return count;
+}
+
 struct allocated_unsplit_pages {
     // Any unsplit (order ALLOC_ORDER) pages we have allocated. Initially, they
     // are all in this list.
@@ -476,20 +485,30 @@ static void init_allocated_unsplit_pages(struct allocated_unsplit_pages *aup) {
 // The pages are returned unsplit.
 //
 // If there are not `n` pages remaining, all remaining pages are returned.
-static void take_unsplit_pages(u64 n,
+//
+// Returns the amount of pages taken.
+static u64 take_unsplit_pages(u64 n,
         struct allocated_unsplit_pages *aup, struct list_head *assigned)
 {
     const u64 nhighorder = n >> ALLOC_ORDER;
     LIST_HEAD(tmp);
+    struct list_head *nth_entry;
+    u64 ret;
 
-    struct list_head *nth_entry = list_nth(&aup->unsplit, nhighorder - 1);
+    if (list_empty(&aup->unsplit)) {
+        return 0;
+    }
+
+    nth_entry = list_nth(&aup->unsplit, nhighorder - 1);
     list_cut_position(&tmp, &aup->unsplit, nth_entry);
+    ret = list_count(&tmp) << ALLOC_ORDER;
     list_splice_tail(&tmp, assigned->prev);
+    return ret;
 }
 
-// Return `n` base pages already split. Or if there are not `n` pages
-// remaining, return all remaining pages.
-static void take_and_split_pages(u64 n,
+// Take `n` base pages already split. Or if there are not `n` pages
+// remaining, take all remaining pages. Return the number of pages taken.
+static u64 take_and_split_pages(u64 n,
         struct allocated_unsplit_pages *aup, struct list_head *assigned)
 {
     u64 nassigned = 0, nsplit;
@@ -502,7 +521,7 @@ static void take_and_split_pages(u64 n,
         // Take as many pages as we can that are already split.
         nsplit = min(aup->nsplit, n - nassigned);
         if (nsplit > 0) {
-            nth_entry = list_nth(&aup->split, n - 1);
+            nth_entry = list_nth(&aup->split, nsplit - 1);
             list_cut_position(&tmp, &aup->split, nth_entry);
             list_splice_tail_init(&tmp, assigned->prev);
             nassigned += nsplit;
@@ -511,14 +530,14 @@ static void take_and_split_pages(u64 n,
 
         // Check if we are done.
         if (nassigned == n) {
-            return;
+            return nassigned;
         }
 
         // There are no more split pages; split a new unsplit page.
         BUG_ON(!list_empty(&aup->split));
         if (list_empty(&aup->unsplit)) {
             // Out of pages...
-            return;
+            return nassigned;
         }
 
         // Split...
@@ -622,7 +641,7 @@ static u64 free_node_pools(struct sumf_node_pools *pools) {
     int ty;
     for (ty = 0; ty < SUMF_NTYPES; ++ty) {
         npages += free_pool(&pools->pools[ty],
-                ty == SUMF_ANON_THP ? HPAGE_SHIFT : 0);
+                ty == SUMF_ANON_THP ? ALLOC_ORDER : 0);
     }
     return npages;
 }
@@ -660,8 +679,6 @@ static inline void list_mk_cache(
     struct list_head *elem;
     u64 i = 0;
 
-    printk(KERN_WARNING "frag: building cache...\n");
-
     cache->length = n / CACHE_GRANULARITY;
     BUG_ON(cache->length > CACHE_MEM_PREALLOC_N);
     cache->cache = cache_mem_prealloc;
@@ -685,25 +702,19 @@ static struct list_head *list_nth_with_cache(
     return list_nth(cache->cache[cachen]->prev, remainder);
 }
 
-static u64 list_count(struct list_head *list) {
-    u64 count = 0;
-    struct list_head *it;
-    list_for_each(it, list) {
-        count += 1;
-    }
-    return count;
-}
-
 // Randomize the given list.
-static void pool_randomize(struct sumf_page_pool *pool) {
-    const u64 npages = pool->npages;
+static void pool_randomize(struct sumf_page_pool *pool, u64 order) {
     struct list_head *head = &pool->pages;
     struct list_head *curr = head->next, *prev = head, *second;
     u32 i = 0, rand;
     struct linked_list_cache cache = { };
-    u64 cachen;
+    u64 cachen, npages;
+
+    BUG_ON(pool->npages % (1 << order) != 0);
+    npages = pool->npages >> order;
 
     if (list_empty(head)) {
+        BUG_ON(pool->npages > 0);
         return;
     }
 
@@ -729,7 +740,7 @@ static void pool_randomize(struct sumf_page_pool *pool) {
         }
 
         if (npages < 100 || i % (npages / 100) == 0) {
-            printk(KERN_ERR "frag: rand %p %d %lld%%\n", head, i, i * 100 / npages);
+            printk(KERN_ERR "frag: rand %d %lld%%\n", i, i * 100 / npages);
         }
 
         // Let the scheduler know we haven't deadlocked...
@@ -782,7 +793,6 @@ static struct profile_node *rand_mp_step(struct profile_node *current_node) {
 static int do_fragment(int nid, u64 npages) {
     int ret;
     struct profile_node *current_node;
-    u64 pages_remaining;
     struct allocated_unsplit_pages aup;
     struct sumf_page_pool *pools = captured_pages[nid].pools;
     struct list_head pages_to_free;
@@ -805,7 +815,6 @@ static int do_fragment(int nid, u64 npages) {
     // unfragmented before (e.g., after a fresh reboot), then we can expect the
     // pages in the list to be fairly contiguous and in order.
     ret = alloc_npages(nid, &npages, &aup);
-    pages_remaining = npages;
     if (ret != 0) {
         printk(KERN_ERR "frag: error allocating: %d\n", ret);
         return ret;
@@ -819,28 +828,40 @@ static int do_fragment(int nid, u64 npages) {
     while (!aup_empty(&aup)) {
         // Based on current_node, we want to remove `npages` pages from
         // `allocated_pages` and set them to the purpose indicated by `flags`.
-        u64 pages = min(pages_remaining, current_node->npages);
+        u64 pages = current_node->npages;
 
         switch (current_node->flags) {
             case FLAGS_NONE:
             case FLAGS_PINNED:
-                take_and_split_pages(pages, &aup, pools[SUMF_PINNED].pages.prev);
+                pages = take_and_split_pages(pages, &aup, pools[SUMF_PINNED].pages.prev);
                 pools[SUMF_PINNED].npages += pages;
+                //printk(KERN_WARNING "frag: P %llu %llu\n",
+                //        pools[SUMF_PINNED].npages,
+                //        list_count(&pools[SUMF_PINNED].pages));
                 break;
 
             case FLAGS_FILE:
-                take_and_split_pages(pages, &aup, pools[SUMF_FILE].pages.prev);
+                pages = take_and_split_pages(pages, &aup, pools[SUMF_FILE].pages.prev);
                 pools[SUMF_FILE].npages += pages;
+                //printk(KERN_WARNING "frag: F %llu %llu\n",
+                //        pools[SUMF_FILE].npages,
+                //        list_count(&pools[SUMF_FILE].pages));
                 break;
 
             case FLAGS_ANON:
-                take_and_split_pages(pages, &aup, pools[SUMF_ANON].pages.prev);
+                pages = take_and_split_pages(pages, &aup, pools[SUMF_ANON].pages.prev);
                 pools[SUMF_ANON].npages += pages;
+                //printk(KERN_WARNING "frag: A %llu %llu\n",
+                //        pools[SUMF_ANON].npages,
+                //        list_count(&pools[SUMF_ANON].pages));
                 break;
 
             case FLAGS_ANON_THP:
-                take_unsplit_pages(pages, &aup, pools[SUMF_ANON_THP].pages.prev);
+                pages = take_unsplit_pages(pages, &aup, pools[SUMF_ANON_THP].pages.prev);
                 pools[SUMF_ANON_THP].npages += pages;
+                //printk(KERN_WARNING "frag: T %llu %llu\n",
+                //        pools[SUMF_ANON_THP].npages,
+                //        list_count(&pools[SUMF_ANON_THP].pages) << ALLOC_ORDER);
                 break;
 
             case FLAGS_BUDDY:
@@ -857,7 +878,6 @@ static int do_fragment(int nid, u64 npages) {
                 goto free_and_error;
         }
 
-        pages_remaining -= pages;
         current_node = rand_mp_step(current_node);
     }
 
@@ -868,16 +888,15 @@ static int do_fragment(int nid, u64 npages) {
     // is in when we use the kpfsnapshot tool. The set of flags for each
     // category is arbitrary -- they just need to be different.
     printk(KERN_WARNING "frag: Randomize file pages. pages=%llu\n", pools[SUMF_FILE].npages);
-    pool_randomize(&pools[SUMF_FILE]);
+    pool_randomize(&pools[SUMF_FILE], 0);
     set_page_flags(&pools[SUMF_FILE].pages, /*lru*/true, /*priv*/false,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", pools[SUMF_ANON].npages);
-    pool_randomize(&pools[SUMF_ANON]);
+    pool_randomize(&pools[SUMF_ANON], 0);
     set_page_flags(&pools[SUMF_ANON].pages, /*lru*/false, /*priv*/true,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", pools[SUMF_ANON_THP].npages);
-    // TODO: probably need a special function to handle the fact that npages is base pages...
-    // pool_randomize(&pools[SUMF_ANON_THP]);
+    pool_randomize(&pools[SUMF_ANON_THP], ALLOC_ORDER);
     set_page_flags(&pools[SUMF_ANON_THP].pages, /*lru*/false, /*priv*/true,
                                     /*priv2*/true, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", pools[SUMF_PINNED].npages);
