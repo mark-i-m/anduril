@@ -861,7 +861,8 @@ static int do_fragment(int nid, u64 npages) {
     set_page_flags(&pools[SUMF_ANON].pages, /*lru*/false, /*priv*/true,
                                 /*priv2*/false, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", pools[SUMF_ANON_THP].npages);
-    pool_randomize(&pools[SUMF_ANON_THP]);
+    // TODO: probably need a special function to handle the fact that npages is base pages...
+    // pool_randomize(&pools[SUMF_ANON_THP]);
     set_page_flags(&pools[SUMF_ANON_THP].pages, /*lru*/false, /*priv*/true,
                                     /*priv2*/true, /*opriv*/true, /*rsvd*/true);
     printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", pools[SUMF_PINNED].npages);
