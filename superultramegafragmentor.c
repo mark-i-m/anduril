@@ -154,6 +154,10 @@ module_param(stats_nactual_alloc, ullong, S_IRUSR | S_IRGRP | S_IROTH);
 static u64 stats_nfree_initially = 0;
 module_param(stats_nfree_initially, ullong, S_IRUSR | S_IRGRP | S_IROTH);
 
+// Stats about how many cycles are spent in the shrinker.
+static u64 stats_shrinker_cycles = 0;
+module_param(stats_shrinker_cycles, ullong, S_IRUSR | S_IRGRP | S_IROTH);
+
 // Profile to fragment memory with.
 #define PROFILE_STR_MAX 2097152
 static char profile_str[PROFILE_STR_MAX];
@@ -962,23 +966,33 @@ static int trigger_set(const char *val, const struct kernel_param *kp) {
 
 static unsigned long
 frag_shrink_count(struct shrinker *shrink, struct shrink_control *sc) {
-    return enable_shrinker
+    unsigned long ret;
+    u64 start_tsc = rdtsc();
+
+    ret = enable_shrinker
         ? sumf_node_count_pages(&captured_pages[sc->nid])
         : 0;
+
+    stats_shrinker_cycles += rdtsc() - start_tsc;
+
+    return ret;
 }
 
 // Free a random subset of `nr_to_scan` pages.
 static unsigned long
 frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
-    struct sumf_page_pool *pools = captured_pages[sc->nid].pools;
+    struct sumf_page_pool *pools;
+    u64 start_tsc = rdtsc();
+
+    pools = captured_pages[sc->nid].pools;
 
     //printk(KERN_WARNING "frag: shrinking...\n");
 
     // Avoid deadlocks where we are trying to allocate and shrink at the same
     // time. We should only enable the shrinker after we are done allocating
     // and fragmenting memory.
-    if (!enable_shrinker) return 0;
+    if (!enable_shrinker) goto out;
 
     spin_lock(&allocation_lock);
 
@@ -1030,6 +1044,9 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     spin_unlock(&allocation_lock);
 
     stats_nshrunk += freed;
+
+out:
+    stats_shrinker_cycles += rdtsc() - start_tsc;
 
     return freed;
 }
