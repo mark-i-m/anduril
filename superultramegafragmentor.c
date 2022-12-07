@@ -418,7 +418,7 @@ static int profile_parse(void) {
             prob_total += edge->prob;
         }
 
-        if (prob_total > MP_GRANULARITY || prob_total < (MP_GRANULARITY * 3 / 4)) {
+        if (prob_total > MP_GRANULARITY || prob_total < (MP_GRANULARITY * 2 / 3)) {
             printk(KERN_ERR "frag: probabilities add to %llu != %d\n",
                     prob_total, MP_GRANULARITY);
             goto err_out;
