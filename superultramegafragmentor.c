@@ -158,6 +158,10 @@ module_param(stats_nfree_initially, ullong, S_IRUSR | S_IRGRP | S_IROTH);
 static u64 stats_shrinker_cycles = 0;
 module_param(stats_shrinker_cycles, ullong, S_IRUSR | S_IRGRP | S_IROTH);
 
+// Stats about how many times the shrinker suspected THP.
+static u64 stats_shrinker_thp_detected = 0;
+module_param(stats_shrinker_thp_detected, ullong, S_IRUSR | S_IRGRP | S_IROTH);
+
 // Profile to fragment memory with.
 #define PROFILE_STR_MAX 2097152
 static char profile_str[PROFILE_STR_MAX];
@@ -984,8 +988,17 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
     unsigned long freed = 0;
     struct sumf_page_pool *pools;
     u64 start_tsc = rdtsc();
+    bool is_maybe_thp;
 
     pools = captured_pages[sc->nid].pools;
+
+    sc->gfp_mask &= ~__GFP_HARDWALL;
+    is_maybe_thp = sc->gfp_mask == GFP_TRANSHUGE_LIGHT ||
+                   sc->gfp_mask == GFP_TRANSHUGE;
+
+    if (is_maybe_thp) {
+        stats_shrinker_thp_detected += 1;
+    }
 
     //printk(KERN_WARNING "frag: shrinking...\n");
 
@@ -1006,7 +1019,7 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
                 || pools[SUMF_ANON_THP].npages > 0)
             && freed < sc->nr_to_scan)
     {
-        switch (prandom_u32() % 2) {
+        switch (is_maybe_thp ? 2 : (prandom_u32() % 2)) {
             case 0: // file
                 if (pools[SUMF_FILE].npages > 0) {
                     free_first_page(&pools[SUMF_FILE].pages, 0);
@@ -1027,8 +1040,8 @@ frag_shrink_scan(struct shrinker *shrink, struct shrink_control *sc) {
                 // fall through
                 // if we don't have single anon pages.
 
-            case 2: // anon thp -- will never happen on it's own. Only happens
-                    // by fall-through.
+            case 2: // anon thp -- only happens by fall-through
+                    // or if we suspect THP.
                 if (pools[SUMF_ANON_THP].npages > 0) {
                     free_first_page(&pools[SUMF_ANON_THP].pages, ALLOC_ORDER);
                     pools[SUMF_ANON_THP].npages -= 1 << ALLOC_ORDER;
