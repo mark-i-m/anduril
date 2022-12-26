@@ -162,6 +162,15 @@ module_param(stats_shrinker_cycles, ullong, S_IRUSR | S_IRGRP | S_IROTH);
 static u64 stats_shrinker_thp_detected = 0;
 module_param(stats_shrinker_thp_detected, ullong, S_IRUSR | S_IRGRP | S_IROTH);
 
+// When set to N, shrink by N pages on each node, if `enable_shrinker` is true.
+static u64 trigger_shrink = 0;
+static int trigger_shrink_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops trigger_shrink_ops = {
+    .set = trigger_shrink_set,
+    .get = param_get_ullong,
+};
+module_param_cb(trigger_shrink, &trigger_shrink_ops, &trigger_shrink, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+
 // Profile to fragment memory with.
 #define PROFILE_STR_MAX 2097152
 static char profile_str[PROFILE_STR_MAX];
@@ -1062,6 +1071,41 @@ out:
     stats_shrinker_cycles += rdtsc() - start_tsc;
 
     return freed;
+}
+
+// Force the shrinker to run and reclaim the given number of pages.
+static unsigned long
+frag_force_shrink_scan(int nid, u64 nscan) {
+    struct shrink_control sc = {
+        .nid = nid,
+        .nr_to_scan = nscan,
+    };
+
+    // Current implementation doesn't use struct shrinker...
+    return frag_shrink_scan(NULL, &sc);
+}
+
+static int trigger_shrink_set(const char *val, const struct kernel_param *kp) {
+    int nid;
+    u64 count = 0;
+
+    // Parse value.
+    int ret = param_set_ullong(val, kp);
+    if (ret != 0) return ret;
+
+    // Trigger fragmentation.
+    if (trigger_shrink > 0) {
+        for_each_online_node(nid) {
+            count = frag_force_shrink_scan(nid, trigger_shrink);
+            printk(KERN_WARNING
+                "frag: force shrink. nid=%d shrunk=%llu\n", nid, count);
+        }
+    }
+
+    // Reset trigger.
+    trigger_shrink = 0;
+
+    return ret;
 }
 
 static struct shrinker frag_shrinker = {
