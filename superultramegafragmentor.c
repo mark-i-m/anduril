@@ -9,6 +9,8 @@
 #include <linux/shrinker.h>
 #include <linux/mm.h>
 #include <linux/proc_fs.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
 
 MODULE_AUTHOR("Mark Mansi");
 MODULE_LICENSE("Dual MIT/GPL");
@@ -121,6 +123,8 @@ static u64 sumf_node_count_pages(struct sumf_node_pools *pools) {
         e->from == profile_node_idx(profile, node); \
         ++e)
 
+static struct task_struct *proactive_shrinker_task = NULL;
+
 ////////////////////////////////////////////////////////////////////////////////
 // Configuration.
 
@@ -140,7 +144,21 @@ module_param(npages, ullong, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
 // Whether to enable the shrinker or not.
 static bool enable_shrinker = 0;
-module_param(enable_shrinker, bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+module_param(enable_shrinker,
+        bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+
+// Whether to enable the proactive shrinker or not. `enable_shrinker` must also be on.
+static bool enable_proactive_shrinker = 0;
+module_param(enable_proactive_shrinker,
+        bool, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+
+static u64 proactive_shrinker_sleep_ms = 500;
+module_param(proactive_shrinker_sleep_ms,
+        ullong, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
+
+static u64 proactive_shrinker_threashold_pages = 512 << (20 - PAGE_SHIFT); // 512 MB
+module_param(proactive_shrinker_threashold_pages,
+        ullong, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH);
 
 // Stats about how many pages were shrunk.
 static u64 stats_nshrunk = 0;
@@ -1108,6 +1126,66 @@ static int trigger_shrink_set(const char *val, const struct kernel_param *kp) {
     return ret;
 }
 
+static int proactive_shrinker_do_work(void *data) {
+    int nid, zid;
+    u64 node_free_pages = 0;
+    struct zone *zone;
+    pg_data_t *pgdat;
+    bool pages_left;
+
+    while (!kthread_should_stop()) {
+        // Sleep to avoid high CPU usage.
+        msleep(proactive_shrinker_sleep_ms);
+
+        // If not enabled, go back to sleep.
+        if (!enable_proactive_shrinker || !enable_shrinker) {
+            continue;
+        }
+
+        // If no pages left, exit.
+        pages_left = false;
+        for_each_online_node(nid) {
+            if (sumf_node_count_pages(&captured_pages[nid]) > 0) {
+                pages_left = true;
+                break;
+            }
+        }
+
+        if (!pages_left) {
+            break;
+        }
+
+        // Iterate over nodes. Check if they are low on memory, and if so,
+        // force the shrinker to release some memory.
+        for_each_online_node(nid) {
+            if (sumf_node_count_pages(&captured_pages[nid]) > 0) {
+                continue;
+            }
+
+            pgdat = NODE_DATA(nid);
+
+            node_free_pages = 0;
+            for (zid = 0; zid < MAX_NR_ZONES; ++zid) {
+                zone = &pgdat->node_zones[zid];
+                if (!populated_zone(zone)) continue;
+
+                node_free_pages += zone_page_state(zone, NR_FREE_PAGES);
+            }
+
+            if (node_free_pages < proactive_shrinker_threashold_pages) {
+                frag_force_shrink_scan(nid,
+                        proactive_shrinker_threashold_pages - node_free_pages);
+            }
+
+            cond_resched();
+        }
+    }
+
+    pr_warn("frag: proactive shrinker exiting.");
+
+    return 0;
+}
+
 static struct shrinker frag_shrinker = {
     .count_objects = frag_shrink_count,
     .scan_objects = frag_shrink_scan,
@@ -1135,14 +1213,26 @@ static int mod_init(void) {
     ent = proc_create("sumf", 0660, NULL, &profile_ops);
 
     // Register shrinker to return memory.
-    ret = register_shrinker(&frag_shrinker, "superultramegafragmentor");
+    ret = register_shrinker(&frag_shrinker, "anduril");
     if (ret) return ret;
+
+    // Start proactive shrinker thread.
+    proactive_shrinker_task = kthread_run(proactive_shrinker_do_work,
+            NULL, "andurilshrk");
+    if (IS_ERR(proactive_shrinker_task)) {
+        ret = PTR_ERR(proactive_shrinker_task);
+        proactive_shrinker_task = NULL;
+        return ret;
+    }
+    pr_warn("frag: proactive shrinker started.");
 
     return 0;
 }
 module_init(mod_init);
 
 static void mod_exit(void) {
+    kthread_stop(proactive_shrinker_task);
+
     unregister_shrinker(&frag_shrinker);
 
     proc_remove(ent);
