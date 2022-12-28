@@ -1210,7 +1210,7 @@ static int mod_init(void) {
 
     // Init sysfs interface.
     memset(profile_str, 0, PROFILE_STR_MAX);
-    ent = proc_create("sumf", 0660, NULL, &profile_ops);
+    ent = proc_create("anduril", 0660, NULL, &profile_ops);
 
     // Register shrinker to return memory.
     ret = register_shrinker(&frag_shrinker, "anduril");
