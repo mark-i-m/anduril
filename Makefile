@@ -5,7 +5,7 @@ else
 	KPATH := $(HOME)/kernel-*/kbuild/
 endif
 
-obj-m := superultramegafragmentor.o
+obj-m := anduril.o
 
 .PHONY: all clean
 
