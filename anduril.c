@@ -619,20 +619,25 @@ static int alloc_npages(int nid, u64 *n, struct allocated_unsplit_pages *aup) {
 }
 
 static void set_page_flags(struct list_head *list, bool lru,
-        bool private, bool private2, bool ownerpriv, bool reserved)
+        bool private, bool private2, bool ownerpriv, bool reserved,
+        u64 order)
 {
+    int i;
     struct page *page;
     list_for_each_entry(page, list, lru) {
-        if (lru) SetPageLRU(page);
-        if (private) SetPagePrivate(page);
-        if (private2) SetPagePrivate2(page);
-        if (ownerpriv) SetPageOwnerPriv1(page);
-        if (reserved) SetPageReserved(page);
+	for (i = 0; i < (1 << order); i++) {
+            if (lru) SetPageLRU(page + i);
+            if (private) SetPagePrivate(page + i);
+            if (private2) SetPagePrivate2(page + i);
+            if (ownerpriv) SetPageOwnerPriv1(page + i);
+            if (reserved) SetPageReserved(page + i);
+        }
     }
 }
 
 // Free the first page of the list or do nothing if the list is empty.
 static inline void free_first_page(struct list_head *list, u64 order) {
+    int i;
     if (!list_empty(list)) {
         // remove from list.
         struct page *p = list_first_entry(list, struct page, lru);
@@ -640,11 +645,13 @@ static inline void free_first_page(struct list_head *list, u64 order) {
 
         // clear any flags we may have set before we release the page to the
         // buddy allocator.
-        ClearPageLRU(p);
-        ClearPagePrivate(p);
-        ClearPagePrivate2(p);
-        ClearPageOwnerPriv1(p);
-        ClearPageReserved(p);
+	for (i = 0; i < (1 << order); i++) {
+            ClearPageLRU(p + i);
+            ClearPagePrivate(p + i);
+            ClearPagePrivate2(p + i);
+            ClearPageOwnerPriv1(p + i);
+            ClearPageReserved(p + i);
+        }
 
         // free the page back to the buddy allocator.
         __free_pages(p, order);
@@ -925,18 +932,18 @@ static int do_fragment(int nid, u64 npages) {
     printk(KERN_WARNING "frag: Randomize file pages. pages=%llu\n", pools[SUMF_FILE].npages);
     pool_randomize(&pools[SUMF_FILE], 0);
     set_page_flags(&pools[SUMF_FILE].pages, /*lru*/true, /*priv*/false,
-                                /*priv2*/false, /*opriv*/true, /*rsvd*/true);
+                                /*priv2*/false, /*opriv*/true, /*rsvd*/true, 0);
     printk(KERN_WARNING "frag: Randomize anon pages. pages=%llu\n", pools[SUMF_ANON].npages);
     pool_randomize(&pools[SUMF_ANON], 0);
     set_page_flags(&pools[SUMF_ANON].pages, /*lru*/false, /*priv*/true,
-                                /*priv2*/false, /*opriv*/true, /*rsvd*/true);
+                                /*priv2*/false, /*opriv*/true, /*rsvd*/true, 0);
     printk(KERN_WARNING "frag: Randomize anon thp pages. pages=%llu\n", pools[SUMF_ANON_THP].npages);
     pool_randomize(&pools[SUMF_ANON_THP], ALLOC_ORDER);
     set_page_flags(&pools[SUMF_ANON_THP].pages, /*lru*/false, /*priv*/true,
-                                    /*priv2*/true, /*opriv*/true, /*rsvd*/true);
+                                    /*priv2*/true, /*opriv*/true, /*rsvd*/true, ALLOC_ORDER);
     printk(KERN_WARNING "frag: Marking pinned pages. pages=%llu\n", pools[SUMF_PINNED].npages);
     set_page_flags(&pools[SUMF_PINNED].pages, /*lru*/false, /*priv*/false,
-                                  /*priv2*/false, /*opriv*/true, /*rsvd*/true);
+                                  /*priv2*/false, /*opriv*/true, /*rsvd*/true, 0);
 
     printk(KERN_WARNING "frag: The deed is done. (node %d) pages=%llu\n", nid, npages);
 
